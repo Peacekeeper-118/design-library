@@ -1,0 +1,9 @@
+# Narrow allowlist: this one upstream test file (meta/astryx) holds fake secrets used to test its own redaction code.
+# Checked by hand on 2026-11-25: values like "hunter2SECRET" and "aB3xK9mQ7pL2vN8rT5wY6zC4dF1gH0jS" are made up.
+# Everything else is still scanned.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "meta/astryx redaction test fixtures (fake secrets)"
+paths = ['''astryx/packages/cli/foundation/debug/redact\.test\.mjs''']
