@@ -1,0 +1,4 @@
+This library includes components from meta/astryx (https://github.com/meta/astryx), MIT License.
+
+The original MIT license text and copyright notice of meta/astryx are kept in astryx/LICENSE. Files under astryx/
+are synced from the upstream project once a week; everything else in this repository is original work by the owner.
