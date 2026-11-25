@@ -1,0 +1,20 @@
+package: @acme/kit
+
+# Acme guide
+
+How zorblax cards fit together.
+
+## Start
+
+Install the kit.
+
+## Colors
+
+Cards use the core tokens.
+
+[token-ref: unknown topic "no-such-topic"]
+
+Read one section: pnpm exec astryx docs acme-guide <section>
+List its sections: pnpm exec astryx docs acme-guide --index
+Up: pnpm exec astryx docs guides
+Previous: pnpm exec astryx docs working-with-ai

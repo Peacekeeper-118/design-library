@@ -1,0 +1,179 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+
+/**
+ * @file devWarning.ts
+ * @input A component/hook name and a message
+ * @output Standardized `Component: message` console warnings and errors
+ * @position Shared dev-logging utility used across components and hooks
+ *
+ * Every message reads `Component: message`, so the source is clear in the
+ * console. Prefer `useDevWarning` in components, because it does not repeat
+ * a warning on each render. These helpers are for plain functions, module
+ * initialization and effects.
+ *
+ * SYNC: When modified, update:
+ * - /packages/core/src/utils/index.ts
+ * - /packages/core/src/hooks/useDevWarning.ts (the render-path counterpart)
+ */
+
+// Bundlers replace this value at build time. The declaration lets a product
+// without Node's types type-check this file.
+declare const process: {readonly env: {readonly NODE_ENV?: string}};
+
+const isDev = process.env.NODE_ENV !== 'production';
+
+/** Format a message as `Component: message`. */
+export function formatDevMessage(component: string, message: string): string {
+  return `${component}: ${message}`;
+}
+
+/**
+ * Dev-only `console.warn` in the standardized `Component: message` format.
+ * A no-op in production — warnings are builder guardrails, not shipped noise.
+ * Extra args (e.g. an offending value) are forwarded to `console.warn`.
+ *
+ * @example
+ * ```
+ * devWarn('Popover', 'children must contain a <button>.');
+ * ```
+ */
+export function devWarn(
+  component: string,
+  message: string,
+  ...args: unknown[]
+): void {
+  if (!isDev) {
+    return;
+  }
+  console.warn(formatDevMessage(component, message), ...args);
+}
+
+/** Warns once for each key. Internal. */
+export type DevWarnings = (
+  component: string,
+  message: string,
+  key?: string,
+) => void;
+
+/** Per-instance diagnostics for hooks and imperative callbacks. Internal. */
+export function createDevWarnings(): DevWarnings {
+  const warned = new Set<string>();
+  return (component: string, message: string, key: string = message): void => {
+    if (process.env.NODE_ENV === 'production' || warned.has(key)) {
+      return;
+    }
+    warned.add(key);
+    devWarn(component, message);
+  };
+}
+
+/**
+ * `console.error` in the standardized `Component: message` format. Unlike
+ * {@link devWarn}, this runs in production too: it reports real runtime
+ * failures (e.g. a thrown callback) that should reach error telemetry.
+ *
+ * @example
+ * ```
+ * devError('Table', 'Plugin at index 0 threw in transform:', error);
+ * ```
+ */
+export function devError(
+  component: string,
+  message: string,
+  ...args: unknown[]
+): void {
+  console.error(formatDevMessage(component, message), ...args);
+}
+
+/**
+ * Make the error that a component throws in development when a required prop
+ * is missing or has the wrong shape. The message names the component, the prop
+ * and the fix, so the builder does not get a TypeError from deep inside.
+ *
+ * Call it only inside an inline `process.env.NODE_ENV !== 'production'` check.
+ * A production bundle then drops the check, the message and this helper, and
+ * the component behaves as it did before.
+ *
+ * @example
+ * ```
+ * if (process.env.NODE_ENV !== 'production' && !Array.isArray(options)) {
+ *   throw devPropError('Selector', 'options', 'must be an array of {value, label} objects.');
+ * }
+ * ```
+ */
+export function devPropError(
+  component: string,
+  prop: string,
+  message: string,
+): Error {
+  return new Error(formatDevMessage(component, `\`${prop}\` ${message}`));
+}
+
+const missingCallbacks = new Map<string, (...args: unknown[]) => never>();
+
+/**
+ * Make a stand-in for a required callback prop that a caller left out. The
+ * stand-in throws {@link devPropError} when the component calls it, instead of
+ * a TypeError such as "onOpenChange is not a function". Each component, prop
+ * and message gets the same function on every render, so Effect dependencies
+ * stay stable.
+ *
+ * Use it only inside an inline `process.env.NODE_ENV !== 'production'` check,
+ * as for `devPropError`.
+ *
+ * @example
+ * ```
+ * if (process.env.NODE_ENV !== 'production' && typeof onOpenChange !== 'function') {
+ *   onOpenChange = devMissingCallback('Dialog', 'onOpenChange', 'is required.');
+ * }
+ * ```
+ */
+export function devMissingCallback(
+  component: string,
+  prop: string,
+  message: string,
+): (...args: unknown[]) => never {
+  const key = `${component}\u0000${prop}\u0000${message}`;
+  let callback = missingCallbacks.get(key);
+  if (callback == null) {
+    callback = () => {
+      throw devPropError(component, prop, message);
+    };
+    missingCallbacks.set(key, callback);
+  }
+  return callback;
+}
+
+const warnedKeys = new Set<string>();
+
+/**
+ * Dev-only warning that fires at most once per `key` for the lifetime of the
+ * app. Use for singleton warnings that aren't tied to a component instance —
+ * a missing translation key, a per-theme perf hint, a one-time fallback.
+ * For per-component-instance warnings, use the `useDevWarning` hook instead.
+ *
+ * @example
+ * ```
+ * warnOnce(`theme:${name}`, 'Theme', `"${name}" uses runtime injection.`);
+ * ```
+ */
+export function warnOnce(
+  key: string,
+  component: string,
+  message: string,
+  ...args: unknown[]
+): void {
+  if (!isDev || warnedKeys.has(key)) {
+    return;
+  }
+  warnedKeys.add(key);
+  console.warn(formatDevMessage(component, message), ...args);
+}
+
+/**
+ * Clear `warnOnce` dedup state. Test-only.
+ * @internal
+ */
+export function __resetDevWarnings(): void {
+  warnedKeys.clear();
+}

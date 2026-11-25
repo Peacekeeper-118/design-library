@@ -1,0 +1,589 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+
+/** @type {import('@astryxdesign/cli/authoring').ComponentAnatomyElement[]} */
+const anatomy = [
+  {
+    name: 'Table',
+    required: true,
+    description:
+      'Semantic table element that groups the table sections, rows, and cells.',
+  },
+  {
+    name: 'Scroll region',
+    required: true,
+    description:
+      'Outer region that scrolls horizontally when columns overflow. Fixed-height virtualization also enables block scrolling; the region enters keyboard order while either applicable axis overflows.',
+  },
+  {
+    name: 'Header section',
+    required: false,
+    description:
+      'Column-heading section generated when data-driven columns are present or supplied with TableHeader in children mode.',
+  },
+  {
+    name: 'Column header cell',
+    required: false,
+    description:
+      'Cell that identifies one column and may contain sorting or bulk-selection controls.',
+  },
+  {
+    name: 'Sort control',
+    required: false,
+    description:
+      "Button that wraps a sortable column label and changes that column's sort direction.",
+  },
+  {
+    name: 'Sort indicator glyph',
+    required: false,
+    description: 'Directional symbol rendered by Icon inside a Sort control.',
+  },
+  {
+    name: 'Sort priority',
+    required: false,
+    description:
+      'Number shown for a sorted column when multi-column sorting is active.',
+  },
+  {
+    name: 'Selection control',
+    required: false,
+    description:
+      'CheckboxInput rendered in the header and selectable body rows by the selection plugin.',
+  },
+  {
+    name: 'Body section',
+    required: true,
+    description:
+      'Section containing data rows or the current empty state; data-driven mode renders it automatically.',
+  },
+  {
+    name: 'Row',
+    required: false,
+    description:
+      'Repeated TableRow that groups cells in a standard header, body, or footer row.',
+  },
+  {
+    name: 'Cell',
+    required: false,
+    description:
+      'TableCell containing one value or caller-provided content in a standard body or footer row.',
+  },
+  {
+    name: 'Default empty state',
+    required: false,
+    description:
+      'Compact EmptyState shown for an empty data array unless it is replaced or disabled.',
+  },
+  {
+    name: 'Expansion control',
+    required: false,
+    description:
+      'Button in a leading cell that expands or collapses one expandable row.',
+  },
+  {
+    name: 'Expansion glyph',
+    required: false,
+    description:
+      'Directional symbol rendered by Icon inside an Expansion control.',
+  },
+  {
+    name: 'Expanded detail panel',
+    required: false,
+    description:
+      'Detail row and spanning cell rendered below an expanded row around caller-provided content.',
+  },
+  {
+    name: 'Footer section',
+    required: false,
+    description:
+      'Optional summary or totals section supplied with TableFooter in children mode.',
+  },
+];
+
+/** @type {import('@astryxdesign/cli/authoring').ComponentDoc} */
+
+export const docs = {
+  name: 'Table',
+  displayName: 'Table',
+  group: 'Table',
+  category: 'Table & List',
+  keywords: [
+    'table',
+    'datatable',
+    'datagrid',
+    'spreadsheet',
+    'sorting',
+    'virtualized',
+    'columns',
+    'rows',
+    'selection',
+    'pinning',
+  ],
+  playground: {
+    defaults: {
+      data: [
+        {name: 'Alice Chen', role: 'Engineer', status: 'Active'},
+        {name: 'Bob Smith', role: 'Designer', status: 'Active'},
+        {name: 'Carol Wu', role: 'PM', status: 'Away'},
+      ],
+      columns: [
+        {key: 'name', header: 'Name'},
+        {key: 'role', header: 'Role'},
+        {key: 'status', header: 'Status'},
+      ],
+    },
+  },
+  theming: {
+    targets: [
+      {className: 'astryx-table'},
+      {className: 'astryx-table-scroll-wrapper'},
+      {className: 'astryx-table-header'},
+      {className: 'astryx-table-body'},
+      {className: 'astryx-table-footer'},
+      {
+        className: 'astryx-table-row',
+        states: ['selected', 'striped'],
+        visualProps: ['parity'],
+      },
+      {className: 'astryx-table-cell', visualProps: ['density']},
+      {className: 'astryx-table-header-cell', visualProps: ['density']},
+    ],
+    vars: [
+      {
+        name: '--table-row-overlay',
+        description:
+          "The row's current fill (its stripe, hover or selection wash), which a pinned column's cells replay over their opaque base. A theme's background on `table-row` sets it too, so a themed stripe or hover reaches pinned columns.",
+        default: 'unset (a pinned cell shows its base)',
+        private: true,
+      },
+      {
+        name: '--_table-open-row-divider-width',
+        description:
+          "The divider width of an open expandable row's cells: 0, because the expansion panel below the row draws the divider, so the row and its panel read as one unit.",
+        default: "unset (a cell draws the theme's border width)",
+        private: true,
+      },
+    ],
+    derived: [{property: 'backgroundColor', vars: ['--table-row-overlay']}],
+    componentIcons: [
+      {
+        slot: 'table-sort-indicator',
+        description:
+          "The sort direction glyph beside a sortable column's label (`useTableSortable`).",
+        fallback:
+          '`arrowUp` ascending; `arrowDown` descending; `arrowsUpDown` unsorted',
+        state: [
+          {
+            name: 'direction',
+            type: "'ascending' | 'descending' | 'none'",
+            description:
+              "The column's sort direction; `none` while the column is not sorted.",
+          },
+        ],
+        whenNull:
+          'Hides the glyph. The Sort control keeps its label and its click and keyboard sorting; the column header keeps `aria-sort`.',
+      },
+      {
+        slot: 'table-row-expand',
+        description:
+          "The glyph in a row's expansion toggle (`useTableRowExpansion`). The toggle turns the glyph a quarter turn while the row is expanded and mirrors it in right-to-left layouts, so map a glyph that points toward the inline end.",
+        fallback: '`chevronRight`, turned while expanded',
+        state: [
+          {
+            name: 'expanded',
+            type: 'boolean',
+            description: "True while the row's detail panel is open.",
+          },
+        ],
+        whenNull:
+          'Hides the glyph. The toggle keeps its size, its "Expand row" or "Collapse row" name, `aria-expanded`, and its click and keyboard toggling.',
+      },
+    ],
+  },
+  description:
+    'Styled, data-driven table with density, dividers, hover highlight, striped rows, and named plugin support. T must extend Record<string, unknown>.',
+  props: [
+    {
+      name: 'data',
+      type: 'T[]',
+      description:
+        'Array of data items to render as rows. T must extend Record<string, unknown> (use `interface MyRow extends Record<string, unknown>` for custom types).',
+    },
+    {
+      name: 'columns',
+      type: 'TableColumn<T>[]',
+      description:
+        "Column definitions: each column has {key, header, width?, align?, renderCell?}, and Table has no onRowClick prop; the supported way to open a dialog, side panel or detail page from a row is a Link or Button in the row's main cell (renderCell) that opens it, and to show a row's details inline on a click anywhere on it, use useTableRowExpansion with hasRowClickExpansion; on a phone, column floors wider than the screen scroll sideways, so for a phone-first page also render one List with `hasDividers` (not a Card per item) and switch with a StyleX `display` rule under `@media` (Best practices). The `header` field sets the column heading text. If omitted, columns are auto-generated from data object keys. The `width` field is typed as `ColumnWidth` (not a number); use `proportional(n)` or `pixel(n)` helpers imported from `@astryxdesign/core/Table`. Omitting `width` keeps an equal flexible share with a compact 60px readability floor. To give one column a different floor, set `width: proportional(1, {minWidth: 80})`; its `minWidth` replaces the 60px floor for that column. Example: `width: pixel(120)` for 120px fixed, `width: proportional(1)` for a flexible column with a 120px default minimum.",
+    },
+    {
+      name: 'idKey',
+      type: '(keyof T & string) | ((item: T) => string | number)',
+      description:
+        'Canonical row identity: a property name projects valid strings and finite numbers to strings; a function retains string/number type. Optional legacy tables fall back to index. Virtualization requires explicit unique valid keys.',
+    },
+    {
+      name: 'density',
+      type: "'compact' | 'balanced' | 'spacious'",
+      description: 'Row density controlling cell padding and font size.',
+      default: "'balanced'",
+    },
+    {
+      name: 'dividers',
+      type: "'rows' | 'columns' | 'grid' | 'none'",
+      description: 'Divider style rendered between cells.',
+      default: "'rows'",
+    },
+    {
+      name: 'isStriped',
+      type: 'boolean',
+      description:
+        "Stripes alternate rows (every other row, zebra striping): a background wash on the even-numbered body and footer rows. A theme restyles either stripe of a data-driven table through the `table-row` target's `parity` (odd or even); every row a striped table may stripe (body and footer rows, not the header row) carries the `striped` state. A pinned column (`useTableStickyColumns`) follows the row's stripe.",
+      default: 'false',
+    },
+    {
+      name: 'hasHover',
+      type: 'boolean',
+      description:
+        'Applies a hover highlight background to rows on pointer devices.',
+      default: 'false',
+    },
+    {
+      name: 'verticalAlign',
+      type: "'middle' | 'top' | 'bottom'",
+      description:
+        'Vertical alignment for body row cells. Controls `vertical-align` on the `<td>` elements.',
+      default: "'middle'",
+    },
+    {
+      name: 'textOverflow',
+      type: "'wrap' | 'truncate'",
+      description:
+        "How cell text behaves when it exceeds the column width. 'wrap' lets text wrap and the row grow taller; 'truncate' clips with an ellipsis (default-rendered cells show a tooltip on hover when truncated). Header cells follow the same mode: under 'wrap' a long heading wraps in a data-driven table, and in children mode its column grows to keep it on one line. When you pass `columns`, a data-driven table sizes them from their definitions, not their content, so under 'wrap' a token longer than its column, such as a code identifier or a URL, breaks inside the token where the line ends. To keep such tokens whole, give that column a floor that fits them, or compose the table in children mode, whose columns follow their content.",
+      default: "'wrap'",
+    },
+    {
+      name: 'virtualization',
+      type: 'TableVirtualizationCapability | TableVirtualizationCapability[]',
+      description:
+        "Geometry-only capability from useTableRowsVirtualization or useTableColumnsVirtualization, or a list with at most one of each; any other list renders without windowing. useTableColumnsVirtualization({initialViewportWidth}) mounts only the unpinned columns near the viewport. useTableRowsVirtualization({rowHeight, initialViewportHeight}) takes sizes that are both positive finite CSS pixels; the Table scrolls inside the height its parent gives it, and initialViewportHeight only sizes the first window. Give the Table's parent a height, fixed or relative, or a flex child, so windowing can bound the rows; with no height every row renders. Pass complete flat data and an explicit idKey. Default text truncates; custom renderers, wrapping, structural plugins, incompatible offsets, invalid identity or unrepresentable geometry use full rendering. Logical row positions include the header.",
+    },
+    {
+      name: 'plugins',
+      type: 'Record<string, TablePlugin<T>>',
+      description:
+        "Named plugins: the objects that the useTable* hooks return, or your own TablePlugin<T> (import the type from @astryxdesign/core/Table), an object of optional transform functions. When the table renders, Table calls transformColumns, transformTable, transformHeaderCell for each header cell, transformHeaderRow, transformScrollWrapper, and then transformTableContext in reverse plugin order, so the first plugin wraps outermost. With column virtualization, transformHeaderCell and transformHeaderRow run after transformScrollWrapper and transformTableContext, because the header renders inside the column window. Then, as each body row renders, Table calls transformBodyRow for that row and then transformBodyCell for each of its cells. Their arguments and results: transformColumns(columns) adds, removes, or reorders columns; transformTable(props) changes the <table> props; transformHeaderCell(props, column, columnIndex, columns) changes a <th>, with slots before, content, after, overlay, and below; transformHeaderRow(props) changes the header <tr>; transformBodyCell(props, column, item, columnIndex, columns, context) changes a <td>; transformBodyRow(props, item, index, context) changes a body <tr>, and can add afterRow content below the row; transformScrollWrapper(props, context) changes the scroll region and can add beforeTable or afterTable content; transformTableContext(children) wraps the table in providers. The element transforms (table, header row, header cell, body row, body cell, scroll wrapper) receive {htmlProps, xstyle, ...} and must return the same shape, with the earlier values kept. Header and body cell transforms can also append contextMenuActions for a right-click menu. A plugin that has transformBodyRow or transformBodyCell and keeps one row per data item must set rowModel: 'flat'; without it, row virtualization uses full rendering and Table ignores plugin loading state (renderState). Keep each plugin object stable (create it in useMemo): a new object on each render renders all rows again. Plugins with the first-party names columnSettings, sort, tree, selection, and pagination run in that order; other names run after them, in record order.",
+    },
+    {
+      name: 'rowIndexStart',
+      type: 'number',
+      description:
+        'ARIA row index (1-based) for the first rendered body row. The row ordinal is an accessibility concern independent of any visible index column, so setting this (or rowCount) makes the table emit aria-rowindex on body rows and aria-rowcount on the table. For a paginated/windowed view, pass the offset of the first visible row (e.g. (page - 1) * pageSize + 1) so aria-rowindex reflects position in the full dataset. Data-driven mode only.',
+      default: '1',
+    },
+    {
+      name: 'rowCount',
+      type: 'number',
+      description:
+        'Total number of body rows across all pages/windows, used for aria-rowcount so assistive tech can announce "row X of Y" against the full dataset. When omitted but rowIndexStart is set (windowed view with an unknown total), aria-rowcount is set to -1 per the ARIA unknown-count convention. Data-driven mode only.',
+    },
+    {
+      name: 'emptyState',
+      type: 'ReactNode | false',
+      description:
+        'Content that shows when data is an empty array, for example an EmptyState that says no rows match the filters. It renders in one row across all columns. Omit it for a compact "No data" EmptyState. Pass false for an empty body. Table does not know why data is empty: choose the content from your own state, for example "No results" when filters are active and "No users yet" when they are not.',
+      default: '<EmptyState title="No data" isCompact />',
+    },
+    {
+      name: 'children',
+      type: 'ReactNode',
+      description:
+        'Children mode: compose the table yourself from TableHeader / TableBody / TableFooter, each holding TableRow and TableCell, instead of using data-driven rendering. The children are passed straight to the <table>, so the section is yours to supply. A TableRow placed directly in Table emits <table><tr>, which is invalid HTML and mismatches on hydration (the parser inserts an implied <tbody> for server-rendered markup; React does not on the client). Data-driven mode renders the sections for you.',
+    },
+    {
+      name: 'xstyle',
+      type: 'StyleXStyles',
+      description:
+        'StyleX styles for layout customization (margins, positioning, sizing). Must be a stylex.create() value: not an inline style object like style={{}}.',
+    },
+  ],
+  components: [
+    {name: 'TableHeader'},
+    {name: 'TableBody'},
+    {name: 'TableFooter'},
+    {name: 'TableRow'},
+    {name: 'TableCell'},
+    {name: 'TableHeaderCell'},
+    {name: 'useTableSelection'},
+    {name: 'useTableSelectionState'},
+    {name: 'TableSelectionToolbar'},
+    {name: 'useTableSortable'},
+    {name: 'useTableTreeData'},
+    {name: 'useTableTreeState'},
+    {name: 'useTablePagination'},
+    {name: 'useTableColumnSettings'},
+    {name: 'useTableFiltering'},
+    {name: 'useTableFilterState'},
+  ],
+  usage: {
+    description:
+      'Table displays structured data in rows and columns with consistent dimensionality. It supports rich cell content, sorting, selection, pagination, and column management through a composable plugin system. Use Table for data sets with uniform structure; for simpler or inconsistent data, consider a list or card layout instead.',
+    bestPractices: [
+      {
+        guidance: true,
+        description:
+          'Use density and divider variants to match the information density and scanning needs of your data.',
+      },
+      {
+        guidance: true,
+        description:
+          'Compose rich cell content with Astryx components like Text, StatusDot, and Avatar via renderCell. Pair a StatusDot with Text, and keep a solid Badge for the rare cell that needs attention.',
+      },
+      {
+        guidance: false,
+        description:
+          'Do not put a control (a button, link, or input) in the header of a sortable column. The Sort control wraps the whole header, so the control nests inside it and assistive technology cannot operate it. Keep header controls on columns that are not sortable.',
+      },
+      {
+        guidance: true,
+        description:
+          'In children mode, put every row inside TableHeader, TableBody, or TableFooter. <table> cannot contain a <tr> directly: the HTML parser inserts an implied <tbody> for server-rendered markup and React does not on the client, so unwrapped rows mismatch on hydration.',
+      },
+      {
+        guidance: true,
+        description:
+          'Omit width for equal flexible columns with a compact 60px readability floor. Give one column its own floor with proportional(1, {minWidth}), weight columns with proportional(n), and fix widths with pixel(); the Table scroll region activates when the combined floors no longer fit.',
+      },
+      {
+        guidance: true,
+        description:
+          'Use the data-driven API from React Server Components: proportional(), pixel(), and column definitions without function props are server-safe. Columns using renderCell (or any function prop) need the table wrapped in a "use client" component, since functions cannot cross the server-client boundary.',
+      },
+      {
+        guidance: true,
+        description:
+          "To open a row (go to a detail page, open a side panel), put a Link or a Button in the row's main cell with renderCell. Table has no row-click prop. A click handler on the <tr> cannot be reached with the keyboard or a screen reader, so do not use it as the only way to open a row. A renderCell column makes a windowed Table (virtualization) render every row.",
+      },
+      {
+        guidance: true,
+        description:
+          'When filters or a search can leave no rows, set emptyState to say so and offer a way out, for example an EmptyState with a "Clear filters" Button.',
+      },
+      {
+        guidance: true,
+        description:
+          'Keep long tokens such as code identifiers whole. When you pass `columns`, a data-driven table sizes them from their definitions, not their content, so a token that does not fit its column breaks inside the token. Give that column proportional(1, {minWidth}) or pixel() wide enough for the token, or compose the table in children mode, whose columns follow their content.',
+      },
+      {
+        guidance: true,
+        description:
+          'When you pass `columns`, floors set with `minWidth` or `pixel()` are minimums and cell content never widens a column, except that a windowed table\u2019s numbering column fits its largest number (only children mode sizes columns to content). When the floors add up to more than the screen, the table scrolls sideways on a phone: the columns past the edge stay out of sight until the reader swipes.',
+      },
+      {
+        guidance: true,
+        description:
+          "For a page read mostly on phones, show the data as a List below a breakpoint instead of a wide table. Render both the List and the Table, and switch them with a StyleX `display` rule, for example `display: {default: 'none', '@media (not (min-width: 768px))': 'block'}` on the List\u2019s wrapper and the reverse on the Table\u2019s, below the theme\u2019s `md` breakpoint (768px by default, or your theme\u2019s own `md`). CSS picks the layout in the first paint and without script; `useMediaQuery` picks it only after the page\u2019s script runs.",
+      },
+      {
+        guidance: false,
+        description:
+          'Use a table for data without consistent columns. Use a list or card layout for heterogeneous content.',
+      },
+      {
+        guidance: false,
+        description:
+          'Put a solid Badge (success, warning, error, info) in every cell of a column. The repeated fills compete with the data; pair a StatusDot with Text instead.',
+      },
+      {
+        guidance: false,
+        description:
+          'Enable every plugin at once. Add only the features your use case requires to keep the interface focused.',
+      },
+      {
+        guidance: false,
+        description:
+          'Rely on the 60px omitted-width floor when a text-heavy column needs more room; set proportional(1, {minWidth}) on that column instead.',
+      },
+    ],
+    anatomy,
+  },
+  examples: [
+    {
+      label: 'Open a row from a link in its main cell',
+      code: `const columns = [
+  {
+    key: 'name',
+    header: 'Name',
+    // A real link: keyboard, screen reader, and open-in-new-tab all work.
+    renderCell: user => <Link href={\`/users/\${user.id}\`}>{user.name}</Link>,
+  },
+  {key: 'role', header: 'Role'},
+];
+
+<Table data={users} columns={columns} idKey="id" hasHover />;`,
+    },
+    {
+      label: 'Open a row in a side panel',
+      code: `const [openId, setOpenId] = useState(null);
+
+const columns = [
+  {
+    key: 'name',
+    header: 'Name',
+    renderCell: user => (
+      <Button label={user.name} variant="ghost" onClick={() => setOpenId(user.id)} />
+    ),
+  },
+  {key: 'role', header: 'Role'},
+];
+
+<Table
+  data={users}
+  columns={columns}
+  idKey="id"
+/>;`,
+    },
+  ],
+};
+
+/** @type {import('@astryxdesign/cli/authoring').ComponentTranslationDoc} */
+export const docsZh = {
+  usage: {
+    description:
+      'Table displays structured data in rows and columns with consistent dimensionality. It supports rich cell content, sorting, selection, pagination, and column management through a composable plugin system. Use Table for data sets with uniform structure; for simpler or inconsistent data, consider a list or card layout instead.',
+    bestPractices: [
+      {
+        guidance: true,
+        description:
+          'Use density and divider variants to match the information density and scanning needs of your data.',
+      },
+      {
+        guidance: true,
+        description:
+          'Compose rich cell content with Astryx components like Text, StatusDot, and Avatar via renderCell. Pair a StatusDot with Text, and keep a solid Badge for the rare cell that needs attention.',
+      },
+      {
+        guidance: true,
+        description:
+          '要打开某一行（进入详情页或打开侧边面板），用 renderCell 在该行的主单元格中放一个 Link 或 Button。Table 没有行点击属性。<tr> 上的点击处理程序无法通过键盘或屏幕阅读器访问，所以不要把它作为打开行的唯一方式。renderCell 列会让开启虚拟化的 Table 渲染所有行。',
+      },
+      {
+        guidance: true,
+        description:
+          '当筛选或搜索可能导致没有行时，设置 emptyState 说明情况并提供出路，例如带“清除筛选”Button 的 EmptyState。',
+      },
+      {
+        guidance: true,
+        description:
+          '让代码标识符等长词元保持完整。传入 `columns` 时，数据驱动的 Table 按列定义而不是内容确定列宽，所以放不下的词元会在词元内部断开。给该列设置足够宽的 proportional(1, {minWidth}) 或 pixel()，或者改用 children 模式组合 Table，其列宽随内容变化。',
+      },
+      {
+        guidance: true,
+        description:
+          '传入 `columns` 时，用 `minWidth` 或 `pixel()` 设置的列宽是最小值，单元格内容不会加宽列，只有开启窗口化的 Table 的行号列会加宽以容纳最后一个行号（只有 children 模式按内容确定列宽）。这些最小宽度加起来超过屏幕宽度时，Table 在手机上会横向滚动：超出边缘的列在读者滑动之前一直看不到。',
+      },
+      {
+        guidance: true,
+        description:
+          "主要在手机上阅读的页面，在断点以下用 List 展示数据，而不是一张宽表格。同时渲染 List 和 Table，并用 StyleX `display` 规则切换：例如在 List 的外层容器上写 `display: {default: 'none', '@media (not (min-width: 768px))': 'block'}`，在 Table 的外层容器上写相反的规则，断点取主题的 `md` 断点（默认 768px；如果主题改了 `md`，用主题的值）。CSS 在首次绘制时、无需脚本就能选对布局；`useMediaQuery` 要等页面脚本运行后才会切换。",
+      },
+      {
+        guidance: false,
+        description:
+          'Use a table for data without consistent columns. Use a list or card layout for heterogeneous content.',
+      },
+      {
+        guidance: false,
+        description:
+          'Put a solid Badge (success, warning, error, info) in every cell of a column. The repeated fills compete with the data; pair a StatusDot with Text instead.',
+      },
+      {
+        guidance: false,
+        description:
+          'Enable every plugin at once. Add only the features your use case requires to keep the interface focused.',
+      },
+    ],
+    anatomy,
+  },
+};
+
+/** @type {import('@astryxdesign/cli/authoring').ComponentTranslationDoc} */
+export const docsDense = {
+  description:
+    'Data-driven table w/ rich cell content via renderCell. Compose cells w/ Text, StatusDot, Avatar, layout primitives. BaseTable provides unstyled structural core w/ composable plugin pipeline.',
+  usage: {
+    description:
+      'Table displays structured data in rows and columns with consistent dimensionality. It supports rich cell content, sorting, selection, pagination, and column management through a composable plugin system. Use Table for data sets with uniform structure; for simpler or inconsistent data, consider a list or card layout instead.',
+    bestPractices: [
+      {
+        guidance: true,
+        description:
+          'Use density and divider variants to match the information density and scanning needs of your data.',
+      },
+      {
+        guidance: true,
+        description:
+          'Compose cells via renderCell w/ Text, StatusDot, Avatar. Pair StatusDot w/ Text; solid Badge only for the rare cell that needs attention.',
+      },
+      {
+        guidance: true,
+        description:
+          'Children mode: wrap rows in TableHeader/TableBody/TableFooter. <table> cannot hold a <tr> directly; the parser adds an implied <tbody> for SSR markup, React does not on the client, so unwrapped rows mismatch on hydration.',
+      },
+      {
+        guidance: true,
+        description:
+          'Omitted width = equal flex w/ compact 60px readability floor. Per-column floor: proportional(1, {minWidth}). Weighted: proportional(n). Fixed: pixel(). Table scrolls when combined floors do not fit.',
+      },
+      {
+        guidance: true,
+        description:
+          'Data-driven API is RSC-safe: proportional(), pixel(), column defs w/o function props work in Server Components. renderCell (any function prop) requires a "use client" wrapper.',
+      },
+      {
+        guidance: true,
+        description:
+          'Row open/click: no row-click prop. Put a Link or Button in the main cell via renderCell. <tr> onClick alone is not keyboard or screen-reader reachable. renderCell turns windowing off (full render).',
+      },
+      {
+        guidance: true,
+        description:
+          'Filtered/searched data can be empty: set emptyState (e.g. EmptyState + "Clear filters" Button).',
+      },
+      {
+        guidance: true,
+        description:
+          'Long tokens (IDs, URLs) under explicit `columns` break inside the token when the column is narrower (sized from definitions, not content). Keep them whole w/ proportional(1, {minWidth}) or pixel() wide enough, or children mode (columns follow content).',
+      },
+      {
+        guidance: true,
+        description:
+          'With `columns`: floors (`minWidth`, `pixel()`) are minimums; content never widens a column, except a windowed numbering column (children mode sizes to content). Floors wider than the screen = sideways scroll on a phone; columns past the edge hidden until a swipe.',
+      },
+      {
+        guidance: true,
+        description:
+          'Phone-first page: below a breakpoint show the data as a List instead of the Table. Render both; switch w/ a StyleX `display` rule under `@media (not (min-width: 768px))` (theme `md` breakpoint; CSS: right layout at first paint, no script). Not `useMediaQuery` (only after script).',
+      },
+      {
+        guidance: false,
+        description:
+          'Put a control (button, link, input) in a sortable column header: the Sort control wraps the header, so the nested control is inoperable for assistive technology. Keep header controls on unsortable columns.',
+      },
+      {
+        guidance: false,
+        description:
+          'Use a table for data without consistent columns. Use a list or card layout for heterogeneous content.',
+      },
+      {
+        guidance: false,
+        description:
+          'Enable every plugin at once. Add only the features your use case requires to keep the interface focused.',
+      },
+      {
+        guidance: false,
+        description:
+          'Rely on the 60px omitted-width floor for a text-heavy column that needs more room; set proportional(1, {minWidth}) on it instead.',
+      },
+    ],
+    anatomy,
+  },
+};

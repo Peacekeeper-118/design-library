@@ -1,0 +1,1812 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  onTestFinished,
+  vi,
+} from 'vitest';
+import {act} from '@testing-library/react';
+import {GestureHost} from '../gestures/GestureHost';
+import {layerRootProps} from '../privateAttributes/layerRoot.stylex';
+import {subscribeInput} from '../utils/inputStream';
+import {
+  holdInput,
+  holdsTouch,
+  isInHeldLayer,
+  isInputShield,
+  LATE_PRESS_MS,
+  LATE_RELEASE_FRAMES,
+  type InputHoldScope,
+} from './inputHold';
+import {subscribeModalOutlets, type ModalOutletChange} from './modalOutlet';
+
+function deferred() {
+  let resolve: () => void = () => {};
+  let reject: (error: unknown) => void = () => {};
+  const promise = new Promise<void>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return {promise, resolve, reject};
+}
+
+/** A layer root with a child, in the document. */
+function mountLayer(): {layer: HTMLElement; child: HTMLElement} {
+  const layer = document.createElement('div');
+  const child = document.createElement('button');
+  layer.append(child);
+  document.body.append(layer);
+  return {layer, child};
+}
+
+const flush = async () => {
+  await Promise.resolve();
+  await Promise.resolve();
+};
+
+/**
+ * Another layer inside `layer`, as the toast viewport sits in an open modal:
+ * a host, with a sibling, around a marked layer root that holds a button.
+ */
+function mountNestedLayer(layer: Element) {
+  const host = document.createElement('div');
+  const sibling = document.createElement('div');
+  const root = document.createElement('div');
+  for (const [name, value] of Object.entries(layerRootProps)) {
+    root.setAttribute(name, value);
+  }
+  const button = document.createElement('button');
+  root.append(button);
+  host.append(sibling, root);
+  layer.append(host);
+  return {host, sibling, root, button};
+}
+
+/**
+ * What a listener throws during a case: jsdom reports it as an `error` event
+ * on the window and goes on dispatching, so a hold whose listener throws
+ * would otherwise pass. None is expected.
+ */
+const listenerErrors: unknown[] = [];
+window.addEventListener('error', event => {
+  listenerErrors.push(event.error);
+});
+
+afterEach(() => {
+  document.body.replaceChildren();
+  vi.restoreAllMocks();
+  expect(listenerErrors.splice(0)).toEqual([]);
+});
+
+describe('holdInput', () => {
+  it('holds a presenting layer with a shield over the viewport until its end settles', async () => {
+    const {layer, child} = mountLayer();
+    const outside = document.createElement('div');
+    document.body.append(outside);
+    const end = deferred();
+    holdInput(layer, {until: end.promise, scope: 'viewport'});
+    const shield = layer.lastElementChild as HTMLElement;
+    expect(shield).not.toBe(child);
+    expect(shield.getAttribute('popover')).toBe('manual');
+    expect(shield.style.position).toBe('fixed');
+    // No pan, and a pinch still zooms the page (spec:AST-094 FR10).
+    expect(shield.style.touchAction).toBe('pinch-zoom');
+    // Its own hit-testing, whatever the layer root's (the browser proof holds
+    // a root that is pointer-events: none).
+    expect(shield.style.pointerEvents).toBe('auto');
+    expect(shield.style.visibility).toBe('visible');
+    expect(isInHeldLayer(child)).toBe(true);
+    expect(isInHeldLayer(shield)).toBe(true);
+    expect(isInHeldLayer(outside)).toBe(false);
+    // Keys and assistive technology stay live while presenting.
+    expect(layer.hasAttribute('inert')).toBe(false);
+    end.resolve();
+    await flush();
+    expect(shield.isConnected).toBe(false);
+    expect(isInHeldLayer(child)).toBe(false);
+  });
+
+  it('swallows a press and a click on the shield before they reach the page, and leaves a touch its start so a pinch can still zoom', () => {
+    const {layer} = mountLayer();
+    holdInput(layer, {until: new Promise(() => {}), scope: 'viewport'});
+    const shield = layer.lastElementChild as HTMLElement;
+    const seen: string[] = [];
+    for (const type of ['pointerdown', 'click', 'touchstart']) {
+      document.addEventListener(type, () => seen.push(type));
+    }
+    const press = new Event('pointerdown', {bubbles: true, cancelable: true});
+    const click = new MouseEvent('click', {bubbles: true, cancelable: true});
+    const touch = new Event('touchstart', {bubbles: true, cancelable: true});
+    // A touch event carries its touch lists.
+    Object.defineProperty(touch, 'changedTouches', {value: [{identifier: 0}]});
+    Object.defineProperty(touch, 'touches', {value: [{identifier: 0}]});
+    shield.dispatchEvent(press);
+    shield.dispatchEvent(click);
+    shield.dispatchEvent(touch);
+    // A touch that starts also ends.
+    const touchEnd = new Event('touchend', {bubbles: true, cancelable: true});
+    Object.defineProperty(touchEnd, 'changedTouches', {
+      value: [{identifier: 0}],
+    });
+    Object.defineProperty(touchEnd, 'touches', {value: []});
+    shield.dispatchEvent(touchEnd);
+    expect(seen).toEqual([]);
+    expect(press.defaultPrevented).toBe(true);
+    expect(click.defaultPrevented).toBe(true);
+    // Cancelling a touch's start would cancel the page's pinch-zoom too.
+    expect(touch.defaultPrevented).toBe(false);
+  });
+
+  it("holds only a non-modal layer's own box with a 'surface' hold: its shield covers the layer, not the viewport (spec:AST-094 FR35)", async () => {
+    const {layer, child} = mountLayer();
+    const outside = document.createElement('div');
+    document.body.append(outside);
+    const end = deferred();
+    holdInput(layer, {until: end.promise, scope: 'surface'});
+    const shield = layer.lastElementChild as HTMLElement;
+    expect(shield).not.toBe(child);
+    // Inside the layer's box, not over the viewport from the top layer.
+    expect(shield.hasAttribute('popover')).toBe(false);
+    expect(shield.style.position).toBe('absolute');
+    expect(shield.style.inset).toBe('0');
+    expect(shield.style.touchAction).toBe('pinch-zoom');
+    expect(shield.style.pointerEvents).toBe('auto');
+    expect(isInputShield(shield)).toBe(true);
+    expect(isInHeldLayer(child)).toBe(true);
+    expect(isInHeldLayer(outside)).toBe(false);
+    expect(layer.hasAttribute('inert')).toBe(false);
+    end.resolve();
+    await flush();
+    expect(shield.isConnected).toBe(false);
+  });
+
+  it("holds a dismissing layer: its content inert, the layer itself live under the shield, each element's inert given back", async () => {
+    const {layer, child} = mountLayer();
+    const already = document.createElement('div');
+    already.setAttribute('inert', '');
+    layer.append(already);
+    child.focus();
+    expect(document.activeElement).toBe(child);
+    const end = deferred();
+    holdInput(layer, {until: end.promise, scope: 'layer'});
+    // Focus leaves the content: a focused element that turns inert would
+    // keep its key activation.
+    expect(document.activeElement).not.toBe(child);
+    const shield = layer.lastElementChild as HTMLElement;
+    expect(shield.getAttribute('popover')).toBe('manual');
+    // The layer stays live so the shield inside it catches every hit: an
+    // inert subtree is no hit target.
+    expect(layer.hasAttribute('inert')).toBe(false);
+    expect(shield.hasAttribute('inert')).toBe(false);
+    expect(child.hasAttribute('inert')).toBe(true);
+    expect(isInHeldLayer(child)).toBe(true);
+    end.reject(new Error('interrupted'));
+    await flush();
+    expect(child.hasAttribute('inert')).toBe(false);
+    expect(already.hasAttribute('inert')).toBe(true);
+    expect(shield.isConnected).toBe(false);
+    expect(isInHeldLayer(child)).toBe(false);
+  });
+
+  it('leaves another layer inside a dismissing layer live, with the path to it: the toast viewport a modal holds keeps its input, and the rest goes inert (spec:AST-003 FR16)', async () => {
+    const {layer, child} = mountLayer();
+    const nested = mountNestedLayer(layer);
+    const end = deferred();
+    holdInput(layer, {until: end.promise, scope: 'layer'});
+    expect(child.hasAttribute('inert')).toBe(true);
+    expect(nested.host.hasAttribute('inert')).toBe(false);
+    expect(nested.root.hasAttribute('inert')).toBe(false);
+    expect(nested.sibling.hasAttribute('inert')).toBe(true);
+    // The gesture host lets a touch on the other layer through, not one on
+    // the dismissing layer's own content.
+    expect(holdsTouch(nested.button)).toBe(false);
+    expect(holdsTouch(child)).toBe(true);
+    end.resolve();
+    await flush();
+    expect(nested.sibling.hasAttribute('inert')).toBe(false);
+    expect(child.hasAttribute('inert')).toBe(false);
+  });
+
+  it('still holds a touch on another layer inside a presenting layer', () => {
+    const {layer} = mountLayer();
+    const nested = mountNestedLayer(layer);
+    holdInput(layer, {until: new Promise(() => {}), scope: 'viewport'});
+    expect(holdsTouch(nested.button)).toBe(true);
+  });
+
+  it('leaves a live region with nothing focusable in a dismissing layer live, so words written during the dismissal reach assistive technology (spec:AST-086 FR2); one that holds a control goes inert', async () => {
+    const {layer} = mountLayer();
+    const status = document.createElement('div');
+    status.setAttribute('role', 'status');
+    const polite = document.createElement('div');
+    polite.setAttribute('aria-live', 'polite');
+    const off = document.createElement('div');
+    off.setAttribute('aria-live', 'off');
+    const withControl = document.createElement('div');
+    withControl.setAttribute('role', 'alert');
+    withControl.append(document.createElement('button'));
+    layer.append(status, polite, off, withControl);
+    const end = deferred();
+    holdInput(layer, {until: end.promise, scope: 'layer'});
+    expect(status.hasAttribute('inert')).toBe(false);
+    expect(polite.hasAttribute('inert')).toBe(false);
+    expect(off.hasAttribute('inert')).toBe(true);
+    expect(withControl.hasAttribute('inert')).toBe(true);
+    end.resolve();
+    await flush();
+  });
+
+  it("puts the global hosts back above a dismissal's shield: it tells the modal outlets a surface entered the top layer, and a presentation does not", async () => {
+    const changes: (ModalOutletChange | undefined)[] = [];
+    onTestFinished(subscribeModalOutlets(change => changes.push(change)));
+    const presenting = mountLayer();
+    const presented = deferred();
+    holdInput(presenting.layer, {until: presented.promise, scope: 'viewport'});
+    expect(changes).toEqual([]);
+    const dismissing = mountLayer();
+    const dismissed = deferred();
+    holdInput(dismissing.layer, {until: dismissed.promise, scope: 'layer'});
+    expect(changes).toEqual(['entry']);
+    presented.resolve();
+    dismissed.resolve();
+    await flush();
+  });
+
+  it('names a live hold’s shield, and only it, so a hit test can skip it', () => {
+    const {layer, child} = mountLayer();
+    const popover = document.createElement('div');
+    popover.setAttribute('popover', 'manual');
+    document.body.append(popover);
+    const release = holdInput(layer, {
+      until: new Promise(() => {}),
+      scope: 'viewport',
+    });
+    const shield = layer.lastElementChild as HTMLElement;
+    expect(isInputShield(shield)).toBe(true);
+    for (const other of [layer, child, popover, null]) {
+      expect(isInputShield(other)).toBe(false);
+    }
+    release();
+    expect(isInputShield(shield)).toBe(false);
+  });
+
+  it('sees slotted content as held: the flat tree, a slotted node to its slot', () => {
+    const host = document.createElement('div');
+    const slotted = document.createElement('button');
+    host.append(slotted);
+    document.body.append(host);
+    const root = host.attachShadow({mode: 'open'});
+    const layer = document.createElement('div');
+    layer.append(document.createElement('slot'));
+    root.append(layer);
+    expect(isInHeldLayer(slotted)).toBe(false);
+    const release = holdInput(layer, {
+      until: new Promise(() => {}),
+      scope: 'viewport',
+    });
+    expect(isInHeldLayer(slotted)).toBe(true);
+    release();
+    expect(isInHeldLayer(slotted)).toBe(false);
+  });
+
+  it('takes an animator handle, ending with its finished', async () => {
+    const {layer, child} = mountLayer();
+    const end = deferred();
+    holdInput(layer, {until: {finished: end.promise}, scope: 'layer'});
+    expect(isInHeldLayer(child)).toBe(true);
+    end.resolve();
+    await flush();
+    expect(isInHeldLayer(child)).toBe(false);
+  });
+
+  it('stacks holds on one layer, either scope, under one shield: it comes back when the last one ends', () => {
+    const {layer, child} = mountLayer();
+    const first = holdInput(layer, {
+      until: new Promise(() => {}),
+      scope: 'viewport',
+    });
+    const second = holdInput(layer, {
+      until: new Promise(() => {}),
+      scope: 'layer',
+    });
+    expect(layer.querySelectorAll('[popover]')).toHaveLength(1);
+    expect(child.hasAttribute('inert')).toBe(true);
+    first();
+    first();
+    expect(isInHeldLayer(child)).toBe(true);
+    expect(layer.querySelectorAll('[popover]')).toHaveLength(1);
+    second();
+    expect(isInHeldLayer(child)).toBe(false);
+    expect(child.hasAttribute('inert')).toBe(false);
+    expect(layer.querySelectorAll('[popover]')).toHaveLength(0);
+  });
+
+  it('registers nothing with the gesture host: the host asks holdsTouch for each touch', () => {
+    const addTouchGate = vi.spyOn(GestureHost.prototype, 'addTouchGate');
+    const {layer, child} = mountLayer();
+    const releaseLayer = holdInput(layer, {
+      until: new Promise(() => {}),
+      scope: 'layer',
+    });
+    const release = holdInput(layer, {
+      until: new Promise(() => {}),
+      scope: 'viewport',
+    });
+    expect(addTouchGate).not.toHaveBeenCalled();
+    expect(isInHeldLayer(child)).toBe(true);
+    expect(holdsTouch(child)).toBe(true);
+    expect(holdsTouch(document.body)).toBe(false);
+    release();
+    releaseLayer();
+    expect(isInHeldLayer(child)).toBe(false);
+    expect(holdsTouch(child)).toBe(false);
+  });
+});
+
+describe("holdInput decides by each event's pointer (spec:AST-094 FR35)", () => {
+  const INIT = {bubbles: true, cancelable: true, composed: true};
+
+  /** The holds a case starts, released after it: a hold listens on the window. */
+  const releases: (() => void)[] = [];
+  const hold = (layer: Element, scope: InputHoldScope = 'viewport') => {
+    const release = holdInput(layer, {until: new Promise(() => {}), scope});
+    releases.push(release);
+    return release;
+  };
+
+  /** Makes `type` the stream's last pointer, as a page's earlier input does. */
+  function lastPointerWas(type: string) {
+    const stop = subscribeInput(window, 'pointermove', () => {});
+    pointer(document.body, 'pointermove', type);
+    stop();
+  }
+
+  // Each case starts as after a finger: no earlier case's mouse lowers its
+  // shield.
+  beforeEach(() => {
+    lastPointerWas('touch');
+  });
+
+  afterEach(() => {
+    for (const release of releases.splice(0)) {
+      release();
+    }
+    // A new press ends a released hold's click window (the held press's
+    // click can no longer come), so its subscriptions end before the next
+    // case rather than lingering into it.
+    pointer(document.body, 'pointerdown', 'mouse');
+    pointer(document.body, 'pointerup', 'mouse');
+  });
+
+  /** A button that records every event that reaches it. */
+  function recorder(parent: Element = document.body) {
+    const button = document.createElement('button');
+    parent.append(button);
+    const reached: string[] = [];
+    for (const type of [
+      'pointerdown',
+      'pointermove',
+      'pointerup',
+      'touchstart',
+      'touchmove',
+      'touchend',
+      'mousedown',
+      'mouseup',
+      'click',
+      'contextmenu',
+    ]) {
+      button.addEventListener(type, () => reached.push(type));
+    }
+    return {button, reached};
+  }
+
+  function pointer(
+    element: Element,
+    type: string,
+    pointerType: string,
+    pointerId = 1,
+    buttons = 0,
+    time?: number,
+  ): Event {
+    const event = new PointerEvent(type, {
+      ...INIT,
+      pointerId,
+      pointerType,
+      buttons,
+    });
+    stamp(event, time);
+    element.dispatchEvent(event);
+    return event;
+  }
+
+  /**
+   * Gives `event` the time an engine stamps on input, on the page's clock.
+   * Without one, jsdom's wall-clock stamp marks input after every hold.
+   */
+  function stamp(event: Event, time: number | undefined) {
+    if (time != null) {
+      Object.defineProperty(event, 'timeStamp', {value: time});
+    }
+  }
+
+  /** The page's clock, at `time` until the case moves it. */
+  function clockAt(time: number) {
+    const clock = {time};
+    vi.spyOn(window.performance, 'now').mockImplementation(() => clock.time);
+    return clock;
+  }
+
+  /** The page's frames: each `draw` runs the waiting callbacks at its time. */
+  function framesOn(clock: {time: number}) {
+    const waiting = new Map<number, FrameRequestCallback>();
+    let next = 1;
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation(callback => {
+      waiting.set(next, callback);
+      return next++;
+    });
+    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(id => {
+      waiting.delete(id);
+    });
+    return {
+      get waiting() {
+        return waiting.size;
+      },
+      /** Draws a frame at each time, in order. */
+      draw(...times: number[]) {
+        for (const time of times) {
+          clock.time = time;
+          const callbacks = [...waiting.values()];
+          waiting.clear();
+          for (const callback of callbacks) {
+            callback(time);
+          }
+        }
+      },
+    };
+  }
+
+  /** Frames at 60 Hz from `from`, `count` of them. */
+  const at60Hz = (from: number, count: number) =>
+    Array.from({length: count}, (_, index) => from + (index * 1000) / 60);
+
+  /** A click as a browser sends it: a pointer event naming its pointer. */
+  function click(element: Element, pointerType: string, detail = 1): Event {
+    const event = new PointerEvent('click', {...INIT, pointerType, detail});
+    element.dispatchEvent(event);
+    return event;
+  }
+
+  /** A compatibility mouse event, or a click sent as a plain mouse event. */
+  function mouse(element: Element, type: string, detail = 1): Event {
+    const event = new MouseEvent(type, {...INIT, detail});
+    element.dispatchEvent(event);
+    return event;
+  }
+
+  function touch(
+    element: Element,
+    type: string,
+    identifiers: number[],
+    down: number = identifiers.length,
+    time?: number,
+  ): Event {
+    const event = new Event(type, INIT);
+    stamp(event, time);
+    const list = identifiers.map(identifier => ({identifier, target: element}));
+    Object.defineProperty(event, 'changedTouches', {value: list});
+    Object.defineProperty(event, 'touches', {
+      value: Array.from({length: down}, (_, identifier) => ({identifier})),
+    });
+    element.dispatchEvent(event);
+    return event;
+  }
+
+  /** A finger's or a pen's tap: down, up, then the browser's click. */
+  function tap(element: Element, pointerType: 'touch' | 'pen', pointerId = 1) {
+    pointer(element, 'pointerdown', pointerType, pointerId);
+    pointer(element, 'pointerup', pointerType, pointerId);
+    click(element, pointerType);
+  }
+
+  it("keeps a held press from the input stream's other subscribers, so press feedback and the gesture host never hear it", () => {
+    const {layer} = mountLayer();
+    const heard: string[] = [];
+    // Subscribed before the hold, as press feedback is on a page with a
+    // pressable.
+    const stops = (['pointerdown', 'pointerup'] as const).map(type =>
+      subscribeInput(window, type, event => {
+        heard.push(`${type}:${event.pointerType}`);
+      }),
+    );
+    hold(layer);
+    pointer(document.body, 'pointerdown', 'touch', 7);
+    pointer(document.body, 'pointerup', 'touch', 7);
+    expect(heard).toEqual([]);
+    // A mouse's press is not held: the other subscribers hear it.
+    pointer(document.body, 'pointerdown', 'mouse', 8);
+    pointer(document.body, 'pointerup', 'mouse', 8);
+    expect(heard).toEqual(['pointerdown:mouse', 'pointerup:mouse']);
+    for (const stop of stops) {
+      stop();
+    }
+  });
+  it("holds a finger's press anywhere in the page, with its moves, release and click, whatever the primary pointer", () => {
+    const {layer} = mountLayer();
+    const {button, reached} = recorder();
+    hold(layer);
+    const down = pointer(button, 'pointerdown', 'touch');
+    pointer(button, 'pointermove', 'touch');
+    pointer(button, 'pointerup', 'touch');
+    click(button, 'touch');
+    // Canceled: the browser sends no compatibility mouse events for it, and
+    // no focus move.
+    expect(down.defaultPrevented).toBe(true);
+    expect(reached).toEqual([]);
+  });
+
+  it("holds a finger's press on a layer under a 'surface' hold and leaves one on the page alone, with its moves, release and click (spec:AST-094 FR35)", () => {
+    const {layer} = mountLayer();
+    const onLayer = recorder(layer);
+    const onPage = recorder();
+    hold(layer, 'surface');
+    // On the page: the page stays live.
+    const down = pointer(onPage.button, 'pointerdown', 'touch', 1);
+    pointer(onPage.button, 'pointermove', 'touch', 1);
+    pointer(onPage.button, 'pointerup', 'touch', 1);
+    click(onPage.button, 'touch');
+    expect(down.defaultPrevented).toBe(false);
+    expect(onPage.reached).toEqual([
+      'pointerdown',
+      'pointermove',
+      'pointerup',
+      'click',
+    ]);
+    const start = touch(onPage.button, 'touchstart', [7]);
+    const move = touch(onPage.button, 'touchmove', [7]);
+    touch(onPage.button, 'touchend', [7], 0);
+    expect(move.defaultPrevented).toBe(false);
+    expect(start.defaultPrevented).toBe(false);
+    expect(onPage.reached.slice(-3)).toEqual([
+      'touchstart',
+      'touchmove',
+      'touchend',
+    ]);
+    expect(holdsTouch(onPage.button)).toBe(false);
+    // On the layer: held, as under a presentation's hold.
+    tap(onLayer.button, 'touch', 2);
+    expect(onLayer.reached).toEqual([]);
+    expect(holdsTouch(onLayer.button)).toBe(true);
+  });
+
+  it("leaves a finger's press on another layer inside a dismissing layer alone, with its release and click (spec:AST-003 FR16)", () => {
+    const {layer} = mountLayer();
+    const nested = mountNestedLayer(layer);
+    nested.button.remove();
+    const {button, reached} = recorder(nested.root);
+    hold(layer, 'layer');
+    pointer(button, 'pointerdown', 'touch');
+    pointer(button, 'pointerup', 'touch');
+    click(button, 'touch');
+    expect(reached).toEqual(['pointerdown', 'pointerup', 'click']);
+  });
+
+  it("holds a pen's press as a finger's", () => {
+    const {layer} = mountLayer();
+    const {button, reached} = recorder(layer);
+    hold(layer);
+    tap(button, 'pen');
+    expect(reached).toEqual([]);
+  });
+
+  it("leaves a mouse's press and click alone during a presentation, a click sent as a plain mouse event included", () => {
+    const {layer} = mountLayer();
+    const {button, reached} = recorder(layer);
+    hold(layer);
+    const down = pointer(button, 'pointerdown', 'mouse');
+    mouse(button, 'mousedown');
+    pointer(button, 'pointerup', 'mouse');
+    mouse(button, 'mouseup');
+    click(button, 'mouse');
+    mouse(button, 'click');
+    expect(down.defaultPrevented).toBe(false);
+    expect(reached).toEqual([
+      'pointerdown',
+      'mousedown',
+      'pointerup',
+      'mouseup',
+      'click',
+      'click',
+    ]);
+  });
+
+  it("lets a mouse through a presentation's shield once it moves, takes hits again at a finger's press, and keeps a dismissal's shield taking every hit", () => {
+    const {layer} = mountLayer();
+    const {button} = recorder(layer);
+    hold(layer);
+    const shield = layer.lastElementChild as HTMLElement;
+    expect(shield.style.pointerEvents).toBe('auto');
+    // A mouse or a trackpad moving on a touch screen: what it points at is
+    // hit, as with no hold.
+    pointer(document.body, 'pointermove', 'mouse');
+    expect(shield.style.pointerEvents).toBe('none');
+    // A finger: the shield is the hit target again for the next one.
+    pointer(button, 'pointerdown', 'touch', 2);
+    expect(shield.style.pointerEvents).toBe('auto');
+    pointer(button, 'pointerup', 'touch', 2);
+    // A dismissal's content is inert: a mouse would fall through it to the
+    // page, so its shield keeps every hit.
+    hold(layer, 'layer');
+    pointer(document.body, 'pointermove', 'mouse');
+    expect(shield.style.pointerEvents).toBe('auto');
+  });
+
+  it("starts a presentation's shield lowered when the stream last heard a mouse: a press where the mouse rests reaches the layer (spec:AST-094 FR35)", () => {
+    const {layer, child} = mountLayer();
+    const {button, reached} = recorder(layer);
+    // Press feedback hears the page's pointer moves through the stream on any
+    // page with a pressable; the mouse moved last, before the layer opened.
+    const stop = subscribeInput(window, 'pointermove', () => {});
+    pointer(document.body, 'pointermove', 'mouse');
+    stop();
+    hold(layer);
+    const shield = layer.lastElementChild as HTMLElement;
+    expect(isInputShield(shield)).toBe(true);
+    expect(shield.style.pointerEvents).toBe('none');
+    expect(holdsTouch(child)).toBe(false);
+    // A key opened the layer; the resting mouse presses without moving.
+    pointer(button, 'pointerdown', 'mouse', 1, 1);
+    pointer(button, 'pointerup', 'mouse');
+    click(button, 'mouse');
+    expect(reached).toEqual(['pointerdown', 'pointerup', 'click']);
+    // A dismissal's shield still takes every hit.
+    hold(layer, 'layer');
+    expect(shield.style.pointerEvents).toBe('auto');
+  });
+
+  /** A mouse comes to rest at (x, y), heard as press feedback hears it. */
+  function mouseRestsAt(x: number, y: number) {
+    const stop = subscribeInput(window, 'pointermove', () => {});
+    document.body.dispatchEvent(
+      new PointerEvent('pointermove', {
+        ...INIT,
+        pointerType: 'mouse',
+        clientX: x,
+        clientY: y,
+      }),
+    );
+    stop();
+  }
+
+  /** The clip-path that leaves a 4 px square open around (x, y). */
+  const openingAt = (x: number, y: number) =>
+    `polygon(0 0, 100% 0, 100% 100%, 0 100%, 0 ${y - 2}px, ${x - 2}px ${y - 2}px, ${x - 2}px ${y + 2}px, ${x + 2}px ${y + 2}px, ${x + 2}px ${y - 2}px, 0 ${y - 2}px)`;
+
+  it("leaves the point where the mouse rests open on a presentation's shield that a finger raised: a still mouse's press reaches what is under it, a finger's press is still held, and a dismissal's shield stays whole (spec:AST-094 FR35)", () => {
+    const {layer} = mountLayer();
+    const {button, reached} = recorder(layer);
+    mouseRestsAt(120, 80);
+    // A finger opened the layer: it is the stream's last pointer.
+    lastPointerWas('touch');
+    hold(layer);
+    const shield = layer.lastElementChild as HTMLElement;
+    expect(shield.style.pointerEvents).toBe('auto');
+    expect(shield.style.getPropertyValue('clip-path')).toBe(openingAt(120, 80));
+    // A finger's or a pen's press is held wherever it lands, there too.
+    pointer(button, 'pointerdown', 'touch', 2);
+    pointer(button, 'pointerup', 'touch', 2);
+    click(button, 'touch');
+    pointer(button, 'pointerdown', 'pen', 4);
+    pointer(button, 'pointerup', 'pen', 4);
+    click(button, 'pen');
+    expect(reached).toEqual([]);
+    expect(shield.style.getPropertyValue('clip-path')).toBe(openingAt(120, 80));
+    // The still mouse's press, which the browser hit-tests through the opening.
+    pointer(button, 'pointerdown', 'mouse', 1, 1);
+    pointer(button, 'pointerup', 'mouse');
+    click(button, 'mouse');
+    expect(reached).toEqual(['pointerdown', 'pointerup', 'click']);
+    // A moving mouse lowers the shield, and the opening goes with it.
+    mouseRestsAt(130, 90);
+    expect(shield.style.pointerEvents).toBe('none');
+    expect(shield.style.getPropertyValue('clip-path')).toBe('');
+    // A finger raises it again, open where the mouse now rests.
+    pointer(button, 'pointerdown', 'touch', 3);
+    expect(shield.style.pointerEvents).toBe('auto');
+    expect(shield.style.getPropertyValue('clip-path')).toBe(openingAt(130, 90));
+    pointer(button, 'pointerup', 'touch', 3);
+    // A dismissal's shield takes every hit, a mouse's included.
+    hold(layer, 'layer');
+    expect(shield.style.pointerEvents).toBe('auto');
+    expect(shield.style.getPropertyValue('clip-path')).toBe('');
+  });
+
+  /** The part of a clip-path that leaves a 4 px square open around (x, y). */
+  const holeAt = (x: number, y: number) =>
+    `0 ${y - 2}px, ${x - 2}px ${y - 2}px, ${x - 2}px ${y + 2}px, ${x + 2}px ${y + 2}px, ${x + 2}px ${y - 2}px, 0 ${y - 2}px`;
+
+  it("leaves a presentation's shield open where a finger or pen went down before it came up, follows that press, and closes the opening when it lifts", () => {
+    const {layer} = mountLayer();
+    const outside = document.createElement('button');
+    document.body.append(outside);
+    const stops = (
+      ['pointerdown', 'pointermove', 'pointerup', 'pointercancel'] as const
+    ).map(type => subscribeInput(window, type, () => {}));
+    const press = (
+      type: string,
+      pointerType: string,
+      id: number,
+      x: number,
+      y: number,
+    ) =>
+      outside.dispatchEvent(
+        new PointerEvent(type, {
+          ...INIT,
+          pointerId: id,
+          pointerType,
+          clientX: x,
+          clientY: y,
+        }),
+      );
+    press('pointerdown', 'touch', 61, 20, 680);
+    press('pointerdown', 'pen', 62, 300, 40);
+    press('pointerdown', 'touch', 63, 90, 90);
+    press('pointerup', 'touch', 63, 90, 90);
+    hold(layer);
+    const shield = layer.lastElementChild as HTMLElement;
+    const clip = () => shield.style.getPropertyValue('clip-path');
+    expect(clip()).toContain(holeAt(20, 680));
+    expect(clip()).toContain(holeAt(300, 40));
+    expect(clip()).not.toContain(holeAt(90, 90));
+    // The opening follows the press, and closes when it lifts.
+    press('pointermove', 'touch', 61, 24, 676);
+    expect(clip()).toContain(holeAt(24, 676));
+    expect(clip()).not.toContain(holeAt(20, 680));
+    press('pointerup', 'touch', 61, 24, 676);
+    expect(clip()).not.toContain(holeAt(24, 676));
+    press('pointercancel', 'pen', 62, 300, 40);
+    expect(clip()).not.toContain(holeAt(300, 40));
+    for (const stop of stops) {
+      stop();
+    }
+    outside.remove();
+  });
+
+  it('merges an earlier press opening that overlaps the still-mouse opening into one box', () => {
+    const {layer} = mountLayer();
+    mouseRestsAt(100, 100);
+    lastPointerWas('touch');
+    const stops = (['pointerdown', 'pointerup', 'pointercancel'] as const).map(
+      type => subscribeInput(window, type, () => {}),
+    );
+    document.body.dispatchEvent(
+      new PointerEvent('pointerdown', {
+        ...INIT,
+        pointerId: 81,
+        pointerType: 'touch',
+        clientX: 103,
+        clientY: 101,
+      }),
+    );
+    hold(layer);
+    const shield = layer.lastElementChild as HTMLElement;
+    expect(shield.style.getPropertyValue('clip-path')).toBe(
+      'polygon(0 0, 100% 0, 100% 100%, 0 100%, 0 98px, 98px 98px, 98px 103px, 105px 103px, 105px 98px, 0 98px)',
+    );
+    document.body.dispatchEvent(
+      new PointerEvent('pointerup', {
+        ...INIT,
+        pointerId: 81,
+        pointerType: 'touch',
+        clientX: 103,
+        clientY: 101,
+      }),
+    );
+    expect(shield.style.getPropertyValue('clip-path')).toBe(
+      openingAt(100, 100),
+    );
+    for (const stop of stops) {
+      stop();
+    }
+  });
+
+  it("gives no opening to a press the press hold holds, and none on a dismissal's shield", () => {
+    const {layer, child} = mountLayer();
+    const stops = (['pointerdown', 'pointerup', 'pointercancel'] as const).map(
+      type => subscribeInput(window, type, () => {}),
+    );
+    const press = (
+      target: Element,
+      type: string,
+      id: number,
+      x: number,
+      y: number,
+    ) =>
+      target.dispatchEvent(
+        new PointerEvent(type, {
+          ...INIT,
+          pointerId: id,
+          pointerType: 'touch',
+          clientX: x,
+          clientY: y,
+        }),
+      );
+    press(document.body, 'pointerdown', 71, 10, 10);
+    hold(layer, 'surface');
+    // Held: it lands on the layer during the surface hold.
+    press(child, 'pointerdown', 72, 50, 50);
+    hold(layer, 'viewport');
+    const shield = layer.lastElementChild as HTMLElement;
+    expect(shield.style.getPropertyValue('clip-path')).toContain(
+      holeAt(10, 10),
+    );
+    expect(shield.style.getPropertyValue('clip-path')).not.toContain(
+      holeAt(50, 50),
+    );
+    // A dismissal's shield takes every hit.
+    hold(layer, 'layer');
+    expect(shield.style.getPropertyValue('clip-path')).toBe('');
+    press(document.body, 'pointerup', 71, 10, 10);
+    press(child, 'pointerup', 72, 50, 50);
+    for (const stop of stops) {
+      stop();
+    }
+  });
+
+  it("stops a shield over the layer's box alone from taking hits once the stream heard a mouse, while a finger's press on the layer is still held (spec:AST-094 FR35)", () => {
+    const {layer} = mountLayer();
+    const {button, reached} = recorder(layer);
+    mouseRestsAt(40, 40);
+    lastPointerWas('touch');
+    hold(layer, 'surface');
+    const shield = layer.lastElementChild as HTMLElement;
+    expect(isInputShield(shield)).toBe(true);
+    expect(shield.style.pointerEvents).toBe('none');
+    pointer(button, 'pointerdown', 'touch', 2);
+    pointer(button, 'pointerup', 'touch', 2);
+    click(button, 'touch');
+    expect(reached).toEqual([]);
+    expect(shield.style.pointerEvents).toBe('none');
+  });
+
+  it("starts a presentation's shield up when the stream last heard a finger, or no pointer at all", () => {
+    const {layer, child} = mountLayer();
+    lastPointerWas('touch');
+    hold(layer);
+    const shield = layer.lastElementChild as HTMLElement;
+    expect(shield.style.pointerEvents).toBe('auto');
+    expect(holdsTouch(child)).toBe(true);
+    // Once a mouse moves during the hold, it passes.
+    pointer(document.body, 'pointermove', 'mouse');
+    expect(shield.style.pointerEvents).toBe('none');
+    expect(holdsTouch(child)).toBe(false);
+  });
+
+  it(`adds its window listeners only while a layer is held, once per document however many layers are held, and removes every one after the last hold ends and its wait of ${LATE_RELEASE_FRAMES} frame intervals for a late press (spec:AST-094 FR24)`, () => {
+    vi.useFakeTimers({toFake: ['setTimeout', 'clearTimeout']});
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    const clock = clockAt(1000);
+    framesOn(clock);
+    const added = vi.spyOn(window, 'addEventListener');
+    const removed = vi.spyOn(window, 'removeEventListener');
+    const listening = () => added.mock.calls.length - removed.mock.calls.length;
+    const first = mountLayer().layer;
+    const second = mountLayer().layer;
+    expect(listening()).toBe(0);
+    const releaseFirst = hold(first);
+    const once = listening();
+    expect(once).toBeGreaterThan(0);
+    const releaseSecond = hold(second, 'layer');
+    expect(listening()).toBe(once);
+    releaseFirst();
+    expect(listening()).toBe(once);
+    releaseSecond();
+    // A press stamped before the release can still arrive: the listeners
+    // stay for the wait, and go with it.
+    const wait = LATE_RELEASE_FRAMES * (1000 / 60);
+    expect(listening()).toBe(once);
+    clock.time += wait - 1;
+    vi.advanceTimersByTime(wait - 1);
+    expect(listening()).toBe(once);
+    clock.time += 1;
+    vi.advanceTimersByTime(1);
+    expect(listening()).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("answers the gesture host's question only while a layer is held, and false after the last hold ends, registering nothing (spec:AST-094 FR24)", () => {
+    const addTouchGate = vi.spyOn(GestureHost.prototype, 'addTouchGate');
+    const {layer, child} = mountLayer();
+    const release = hold(layer);
+    expect(holdsTouch(child)).toBe(true);
+    hold(mountLayer().layer)();
+    expect(holdsTouch(child)).toBe(true);
+    release();
+    expect(holdsTouch(child)).toBe(false);
+    expect(addTouchGate).not.toHaveBeenCalled();
+  });
+
+  it("lets the gesture host's gate pass a mouse during a presentation and hold it during a dismissal", () => {
+    const {layer, child} = mountLayer();
+    hold(layer);
+    // What the gesture host asks the hold for every touch.
+    const isGated = holdsTouch;
+    // Before any pointer: held.
+    expect(isGated(child)).toBe(true);
+    pointer(child, 'pointermove', 'mouse');
+    pointer(child, 'pointerdown', 'mouse');
+    expect(isGated(child)).toBe(false);
+    pointer(child, 'pointerup', 'mouse');
+    pointer(child, 'pointerdown', 'touch', 2);
+    expect(isGated(child)).toBe(true);
+    pointer(child, 'pointerup', 'touch', 2);
+    hold(layer, 'layer');
+    pointer(child, 'pointermove', 'mouse');
+    pointer(child, 'pointerdown', 'mouse');
+    expect(isGated(child)).toBe(true);
+    expect(isGated(document.body)).toBe(false);
+  });
+
+  it("keeps a presentation's shield up for a mouse press that begins on it, to that press's end, and the gate holds what lands on the shield: its release and click are the shield's, not what lies beneath", () => {
+    const {layer, child} = mountLayer();
+    hold(layer);
+    const shield = layer.lastElementChild as HTMLElement;
+    const isGated = holdsTouch;
+    // A mouse that has not moved during the hold presses: the press meets
+    // the shield, which stays up through the press, a drag included.
+    pointer(shield, 'pointerdown', 'mouse', 1, 1);
+    expect(shield.style.pointerEvents).toBe('auto');
+    pointer(shield, 'pointermove', 'mouse', 1, 1);
+    expect(shield.style.pointerEvents).toBe('auto');
+    expect(isGated(shield)).toBe(true);
+    pointer(shield, 'pointerup', 'mouse');
+    // Only a mouse moving with no button down lets it through.
+    pointer(document.body, 'pointermove', 'mouse');
+    expect(shield.style.pointerEvents).toBe('none');
+    expect(isGated(child)).toBe(false);
+    // What lands on a shield is held, a mouse's press included.
+    expect(isGated(shield)).toBe(true);
+  });
+
+  it('swallows a synthetic press that lands past a lowered shield without capturing it: it has no active pointer to capture', () => {
+    // jsdom implements no pointer capture; a browser's setPointerCapture
+    // throws NotFoundError for a pointer that is not active, as a synthetic
+    // press's is not.
+    const setPointerCapture = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, 'setPointerCapture', {
+      configurable: true,
+      value: setPointerCapture,
+    });
+    onTestFinished(() => {
+      Reflect.deleteProperty(HTMLElement.prototype, 'setPointerCapture');
+    });
+    const {layer} = mountLayer();
+    const {button, reached} = recorder();
+    hold(layer);
+    // A moving mouse lowers the shield, so the finger lands past it.
+    pointer(document.body, 'pointermove', 'mouse');
+    const down = pointer(button, 'pointerdown', 'touch');
+    pointer(button, 'pointerup', 'touch');
+    click(button, 'touch');
+    expect(setPointerCapture).not.toHaveBeenCalled();
+    expect(down.defaultPrevented).toBe(true);
+    expect(reached).toEqual([]);
+  });
+
+  it('lets a key or assistive technology click through: it counts no press', () => {
+    const {layer} = mountLayer();
+    const {button, reached} = recorder(layer);
+    hold(layer);
+    pointer(button, 'pointerdown', 'touch');
+    pointer(button, 'pointerup', 'touch');
+    click(button, '', 0);
+    expect(reached).toEqual(['click']);
+  });
+
+  it("never cancels a touch's start, and cancels a move only while one finger is down", () => {
+    const {layer} = mountLayer();
+    const {button, reached} = recorder(layer);
+    hold(layer);
+    expect(touch(button, 'touchstart', [1]).defaultPrevented).toBe(false);
+    expect(touch(button, 'touchmove', [1]).defaultPrevented).toBe(true);
+    // A second finger: a pinch, which still zooms the page.
+    expect(touch(button, 'touchstart', [2], 2).defaultPrevented).toBe(false);
+    expect(touch(button, 'touchmove', [1, 2]).defaultPrevented).toBe(false);
+    touch(button, 'touchend', [1, 2], 0);
+    expect(reached).toEqual([]);
+  });
+
+  it('swallows the compatibility mouse events and the click a browser sends after a held touch', () => {
+    const {layer} = mountLayer();
+    const {button, reached} = recorder(layer);
+    hold(layer);
+    touch(button, 'touchstart', [1]);
+    expect(touch(button, 'touchend', [1], 0).defaultPrevented).toBe(true);
+    mouse(button, 'mousedown');
+    mouse(button, 'mouseup');
+    mouse(button, 'click');
+    expect(reached).toEqual([]);
+  });
+
+  it('follows a press that landed during the hold to its end, past the release, and leaves the next tap alone', () => {
+    const {layer} = mountLayer();
+    const {button, reached} = recorder();
+    const release = hold(layer);
+    pointer(button, 'pointerdown', 'touch');
+    release();
+    pointer(button, 'pointerup', 'touch');
+    click(button, 'touch');
+    expect(reached).toEqual([]);
+    // The next tap is the page's again.
+    tap(button, 'touch', 2);
+    expect(reached).toEqual(['pointerdown', 'pointerup', 'click']);
+  });
+
+  it("holds a finger's press that went down during the hold and arrives after its end, when a long task ran the release: its release, end and click never reach the page (spec:AST-094 FR35)", () => {
+    const clock = clockAt(1000);
+    const frames = framesOn(clock);
+    const {layer} = mountLayer();
+    const {button, reached} = recorder();
+    const release = hold(layer);
+    frames.draw(...at60Hz(1000, 4));
+    // A long task: no frame for 100 ms, then the release.
+    clock.time = 1150;
+    release();
+    // The engine dispatches the press after the task.
+    clock.time = 1160;
+    pointer(button, 'pointerdown', 'touch', 1, 0, 1080);
+    touch(button, 'touchstart', [0], 1, 1080);
+    pointer(button, 'pointerup', 'touch', 1, 0, 1160);
+    const end = touch(button, 'touchend', [0], 0, 1160);
+    mouse(button, 'mousedown');
+    mouse(button, 'mouseup');
+    click(button, 'touch');
+    expect(end.defaultPrevented).toBe(true);
+    expect(reached).toEqual([]);
+  });
+
+  it("judges a finger's press once, by its time: when a long task ends the hold between its pointerdown and its touchstart, both are held (spec:AST-094 FR35)", () => {
+    const clock = clockAt(1000);
+    const frames = framesOn(clock);
+    const {layer} = mountLayer();
+    const {button, reached} = recorder();
+    const release = hold(layer);
+    frames.draw(...at60Hz(1000, 4));
+    clock.time = 1060;
+    pointer(button, 'pointerdown', 'touch', 1, 0, 1060);
+    clock.time = 1150;
+    release();
+    touch(button, 'touchstart', [0], 1, 1060);
+    pointer(button, 'pointerup', 'touch', 1, 0, 1160);
+    const end = touch(button, 'touchend', [0], 0, 1160);
+    click(button, 'touch');
+    expect(end.defaultPrevented).toBe(true);
+    expect(reached).toEqual([]);
+  });
+
+  it("judges a finger's press once: a touchstart that gives a held pointerdown's time is held, though the engine dispatches it after the wait for a late press, and so are its end and click (spec:AST-094 FR35)", () => {
+    const clock = clockAt(1000);
+    const frames = framesOn(clock);
+    const {layer} = mountLayer();
+    const {button, reached} = recorder();
+    const release = hold(layer);
+    frames.draw(...at60Hz(1000, 4));
+    // A phone's timing: the release comes in time, and the finger went down
+    // 1 ms before it. The engine dispatches the pointerdown 23 ms after the
+    // finger landed, inside the wait, and the touchstart 36 ms after, past
+    // it.
+    clock.time = 1056.6;
+    release();
+    clock.time = 1078.6;
+    pointer(button, 'pointerdown', 'touch', 1, 0, 1055.6);
+    clock.time = 1091.6;
+    touch(button, 'touchstart', [0], 1, 1055.6);
+    clock.time = 1140;
+    pointer(button, 'pointerup', 'touch', 1, 0, 1140);
+    const end = touch(button, 'touchend', [0], 0, 1140);
+    click(button, 'touch');
+    expect(end.defaultPrevented).toBe(true);
+    expect(reached).toEqual([]);
+    // A finger that lands later is its own press, and the page's.
+    clock.time = 1200;
+    pointer(button, 'pointerdown', 'touch', 2, 0, 1200);
+    touch(button, 'touchstart', [1], 1, 1200);
+    expect(reached).toEqual(['pointerdown', 'touchstart']);
+  });
+
+  it("gives a held start's verdict only to its own finger: two fingers that start together in one touch event under a 'surface' hold, one on the layer and one on the page, keep their own verdicts (spec:AST-094 FR35)", () => {
+    const clock = clockAt(1000);
+    const {layer} = mountLayer();
+    const onLayer = recorder(layer);
+    const onPage = recorder();
+    hold(layer, 'surface');
+    clock.time = 1010;
+    pointer(onLayer.button, 'pointerdown', 'touch', 1, 0, 1005);
+    pointer(onPage.button, 'pointerdown', 'touch', 2, 0, 1005);
+    // One touch event for both fingers, with each touch's own target.
+    const start = new Event('touchstart', INIT);
+    stamp(start, 1005);
+    Object.defineProperty(start, 'changedTouches', {
+      value: [
+        {identifier: 0, target: onLayer.button},
+        {identifier: 1, target: onPage.button},
+      ],
+    });
+    Object.defineProperty(start, 'touches', {
+      value: [{identifier: 0}, {identifier: 1}],
+    });
+    document.body.dispatchEvent(start);
+    clock.time = 1080;
+    pointer(onPage.button, 'pointerup', 'touch', 2, 0, 1080);
+    const pageEnd = touch(onPage.button, 'touchend', [1], 1, 1080);
+    // The page stays live around the layer: the page finger's end is not
+    // canceled, so the browser sends its click.
+    expect(pageEnd.defaultPrevented).toBe(false);
+    expect(onPage.reached).toEqual(['pointerdown', 'pointerup', 'touchend']);
+    pointer(onLayer.button, 'pointerup', 'touch', 1, 0, 1081);
+    const layerEnd = touch(onLayer.button, 'touchend', [0], 0, 1081);
+    expect(layerEnd.defaultPrevented).toBe(true);
+    expect(onLayer.reached).toEqual([]);
+  });
+
+  it("gives a held start's verdict only to its own finger when each finger's touchstart comes alone, the page finger's first (spec:AST-094 FR35)", () => {
+    const clock = clockAt(1000);
+    const {layer} = mountLayer();
+    const onLayer = recorder(layer);
+    const onPage = recorder();
+    hold(layer, 'surface');
+    clock.time = 1010;
+    pointer(onLayer.button, 'pointerdown', 'touch', 1, 0, 1005);
+    pointer(onPage.button, 'pointerdown', 'touch', 2, 0, 1005);
+    touch(onPage.button, 'touchstart', [1], 2, 1005);
+    touch(onLayer.button, 'touchstart', [0], 2, 1005);
+    clock.time = 1080;
+    pointer(onPage.button, 'pointerup', 'touch', 2, 0, 1080);
+    const pageEnd = touch(onPage.button, 'touchend', [1], 1, 1080);
+    expect(pageEnd.defaultPrevented).toBe(false);
+    expect(onPage.reached).toEqual([
+      'pointerdown',
+      'touchstart',
+      'pointerup',
+      'touchend',
+    ]);
+    pointer(onLayer.button, 'pointerup', 'touch', 1, 0, 1081);
+    const layerEnd = touch(onLayer.button, 'touchend', [0], 0, 1081);
+    expect(layerEnd.defaultPrevented).toBe(true);
+    expect(onLayer.reached).toEqual([]);
+  });
+
+  it("judges a pen's press once too: a pen that also sends touch events has its touchstart held after the wait when its pointerdown was held inside it (spec:AST-094 FR35)", () => {
+    const clock = clockAt(1000);
+    const frames = framesOn(clock);
+    const {layer} = mountLayer();
+    const {button, reached} = recorder();
+    const release = hold(layer);
+    frames.draw(...at60Hz(1000, 4));
+    clock.time = 1056.6;
+    release();
+    clock.time = 1078.6;
+    pointer(button, 'pointerdown', 'pen', 1, 0, 1055.6);
+    clock.time = 1091.6;
+    touch(button, 'touchstart', [0], 1, 1055.6);
+    clock.time = 1140;
+    pointer(button, 'pointerup', 'pen', 1, 0, 1140);
+    const end = touch(button, 'touchend', [0], 0, 1140);
+    click(button, 'pen');
+    expect(end.defaultPrevented).toBe(true);
+    expect(reached).toEqual([]);
+  });
+
+  it("judges a finger's press once in either order: a pointerdown that gives a held touchstart's time is held after the wait for a late press, and so are its release, end and click (spec:AST-094 FR35)", () => {
+    const clock = clockAt(1000);
+    const frames = framesOn(clock);
+    const {layer} = mountLayer();
+    const {button, reached} = recorder();
+    const release = hold(layer);
+    frames.draw(...at60Hz(1000, 4));
+    clock.time = 1056.6;
+    release();
+    clock.time = 1078.6;
+    touch(button, 'touchstart', [0], 1, 1055.6);
+    clock.time = 1091.6;
+    pointer(button, 'pointerdown', 'touch', 1, 0, 1055.6);
+    clock.time = 1140;
+    pointer(button, 'pointerup', 'touch', 1, 0, 1140);
+    const end = touch(button, 'touchend', [0], 0, 1140);
+    click(button, 'touch');
+    expect(end.defaultPrevented).toBe(true);
+    expect(reached).toEqual([]);
+  });
+
+  it("holds a finger's press that went down just before a release in time and arrives just after it, as an engine dispatches a press some milliseconds after it lands: its release, end and click never reach the page (spec:AST-094 FR35)", () => {
+    const clock = clockAt(1000);
+    const frames = framesOn(clock);
+    const {layer} = mountLayer();
+    const {button, reached} = recorder();
+    const release = hold(layer);
+    frames.draw(...at60Hz(1000, 4));
+    // A device's timing: the release comes 6.6 ms after the last frame, the
+    // finger went down 1 ms before it, and the engine dispatches it 5.5 ms
+    // after it.
+    clock.time = 1056.6;
+    release();
+    clock.time = 1062.1;
+    pointer(button, 'pointerdown', 'touch', 1, 0, 1055.6);
+    touch(button, 'touchstart', [0], 1, 1055.6);
+    clock.time = 1140;
+    pointer(button, 'pointerup', 'touch', 1, 0, 1140);
+    const end = touch(button, 'touchend', [0], 0, 1140);
+    mouse(button, 'mousedown');
+    mouse(button, 'mouseup');
+    click(button, 'touch');
+    expect(end.defaultPrevented).toBe(true);
+    expect(reached).toEqual([]);
+    // A press that went down after the release is the page's.
+    clock.time = 1200;
+    pointer(button, 'pointerdown', 'touch', 2, 0, 1200);
+    expect(reached).toEqual(['pointerdown']);
+  });
+
+  it(`waits ${LATE_RELEASE_FRAMES} of the hold's frame intervals for a late press after a release in time, at most: its listeners and timer stay only that long, it asks for no frame, and then a press that went down during the hold is the page's (spec:AST-094 FR24)`, () => {
+    vi.useFakeTimers({toFake: ['setTimeout', 'clearTimeout']});
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    const clock = clockAt(1000);
+    const frames = framesOn(clock);
+    const added = vi.spyOn(window, 'addEventListener');
+    const removed = vi.spyOn(window, 'removeEventListener');
+    const listening = () => added.mock.calls.length - removed.mock.calls.length;
+    const {layer} = mountLayer();
+    const {button, reached} = recorder();
+    const release = hold(layer);
+    expect(frames.waiting).toBe(1);
+    frames.draw(...at60Hz(1000, 4));
+    // The release comes 10 ms after the last frame.
+    clock.time = 1060;
+    release();
+    const wait = LATE_RELEASE_FRAMES * (1000 / 60);
+    expect(frames.waiting).toBe(0);
+    expect(listening()).toBeGreaterThan(0);
+    expect(vi.getTimerCount()).toBe(1);
+    clock.time = 1060 + wait - 1;
+    vi.advanceTimersByTime(wait - 1);
+    expect(listening()).toBeGreaterThan(0);
+    clock.time += 1;
+    vi.advanceTimersByTime(1);
+    expect(listening()).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(frames.waiting).toBe(0);
+    clock.time += 5;
+    pointer(button, 'pointerdown', 'touch', 1, 0, 1055);
+    pointer(button, 'pointerup', 'touch', 1, 0, clock.time);
+    expect(reached).toEqual(['pointerdown', 'pointerup']);
+  });
+
+  it('ends the wait after a release in time at the first input stamped at or after the release: input comes in order, so no press from the hold is left, and its subscriptions end (spec:AST-094 FR24)', () => {
+    vi.useFakeTimers({toFake: ['setTimeout', 'clearTimeout']});
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    const clock = clockAt(1000);
+    const frames = framesOn(clock);
+    const added = vi.spyOn(window, 'addEventListener');
+    const removed = vi.spyOn(window, 'removeEventListener');
+    const listening = () => added.mock.calls.length - removed.mock.calls.length;
+    const {layer} = mountLayer();
+    const release = hold(layer);
+    frames.draw(...at60Hz(1000, 4));
+    clock.time = 1060;
+    release();
+    expect(listening()).toBeGreaterThan(0);
+    // A mouse's move, stamped after the release, comes after any press from
+    // the hold.
+    clock.time = 1065;
+    pointer(document.body, 'pointermove', 'mouse', 9, 0, 1064);
+    expect(listening()).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it(`reads a release by the hold's own frames: at 30 Hz, a release 50 ms after a frame is in time and waits ${LATE_RELEASE_FRAMES} of its intervals, 67 ms, and one 80 ms after it is in a long task and waits ${LATE_PRESS_MS} ms (spec:AST-094 FR35)`, () => {
+    const clock = clockAt(1000);
+    const frames = framesOn(clock);
+    const {layer} = mountLayer();
+    const {button, reached} = recorder();
+    const at30Hz = (from: number) =>
+      Array.from({length: 4}, (_, index) => from + (index * 1000) / 30);
+    // 50 ms after the last frame: in time. A press from the hold that comes
+    // 60 ms after the release is held; at 60 Hz it would be past the wait.
+    const release = hold(layer);
+    frames.draw(...at30Hz(1000));
+    clock.time = 1150;
+    release();
+    clock.time = 1210;
+    pointer(button, 'pointerdown', 'touch', 1, 0, 1110);
+    pointer(button, 'pointerup', 'touch', 1, 0, 1210);
+    expect(reached).toEqual([]);
+    // In time again: a press from the hold that comes 70 ms after the
+    // release is past the wait, and the page's.
+    const next = hold(layer);
+    frames.draw(...at30Hz(1300));
+    clock.time = 1450;
+    next();
+    clock.time = 1520;
+    pointer(button, 'pointerdown', 'touch', 2, 0, 1410);
+    expect(reached).toEqual(['pointerdown']);
+    pointer(button, 'pointerup', 'touch', 2, 0, 1520);
+    // 80 ms after the last frame: a long task. A press from the hold that
+    // comes 220 ms after the release is held.
+    const again = hold(layer);
+    frames.draw(...at30Hz(1700));
+    clock.time = 1880;
+    again();
+    clock.time = 2100;
+    pointer(button, 'pointerdown', 'touch', 3, 0, 1810);
+    pointer(button, 'pointerup', 'touch', 3, 0, 2100);
+    expect(reached).toEqual(['pointerdown', 'pointerup']);
+  });
+
+  it('waits for a late press when the release runs in the frame that ends a long task: input from that task can come after the frame (spec:AST-094 FR35)', () => {
+    const clock = clockAt(1000);
+    const frames = framesOn(clock);
+    const {layer} = mountLayer();
+    const {button, reached} = recorder();
+    const release = hold(layer);
+    frames.draw(...at60Hz(1000, 4));
+    // A long task to 1150, then the frame that ends it, and the release in it.
+    frames.draw(1150);
+    clock.time = 1152;
+    release();
+    clock.time = 1160;
+    pointer(button, 'pointerdown', 'touch', 1, 0, 1080);
+    pointer(button, 'pointerup', 'touch', 1, 0, 1160);
+    expect(reached).toEqual([]);
+  });
+
+  it(`holds a late press to its end, though it stays down past the ${LATE_PRESS_MS} ms that the wait takes new late presses: a long press's release, pointerup and click never reach the page (spec:AST-094 FR35)`, () => {
+    vi.useFakeTimers({toFake: ['setTimeout', 'clearTimeout']});
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    const clock = clockAt(1000);
+    const frames = framesOn(clock);
+    const added = vi.spyOn(window, 'addEventListener');
+    const removed = vi.spyOn(window, 'removeEventListener');
+    const listening = () => added.mock.calls.length - removed.mock.calls.length;
+    const {layer} = mountLayer();
+    const {button, reached} = recorder();
+    const release = hold(layer);
+    const once = listening();
+    frames.draw(...at60Hz(1000, 4));
+    clock.time = 1150;
+    release();
+    // The engine dispatches the press after the long task.
+    clock.time = 1160;
+    pointer(button, 'pointerdown', 'touch', 1, 0, 1080);
+    touch(button, 'touchstart', [0], 1, 1080);
+    // The finger stays down past the wait.
+    clock.time += LATE_PRESS_MS + 200;
+    vi.advanceTimersByTime(LATE_PRESS_MS + 200);
+    expect(listening()).toBe(once);
+    const up = pointer(button, 'pointerup', 'touch', 1, 0, clock.time);
+    const end = touch(button, 'touchend', [0], 0, clock.time);
+    mouse(button, 'mousedown');
+    mouse(button, 'mouseup');
+    click(button, 'touch');
+    expect(up.defaultPrevented).toBe(true);
+    expect(end.defaultPrevented).toBe(true);
+    expect(reached).toEqual([]);
+    // Its click window ends, and so do the subscriptions.
+    clock.time += 800;
+    vi.advanceTimersByTime(800);
+    expect(listening()).toBe(0);
+  });
+
+  it("judges a wall-clock stamp, as jsdom gives, by its age on the page's clock: a late press stamped 80 ms before now is held (spec:AST-094 FR35)", () => {
+    const clock = clockAt(1000);
+    const frames = framesOn(clock);
+    const {layer} = mountLayer();
+    const {button, reached} = recorder();
+    const release = hold(layer);
+    frames.draw(...at60Hz(1000, 4));
+    clock.time = 1150;
+    release();
+    clock.time = 1160;
+    // 80 ms ago on the wall clock is 1080 on the page's clock.
+    pointer(button, 'pointerdown', 'touch', 1, 0, Date.now() - 80);
+    pointer(button, 'pointerup', 'touch', 1, 0, Date.now());
+    expect(reached).toEqual([]);
+  });
+
+  it("lets a press through that went down at or after the hold's end, or before it began: a tap after the release acts", () => {
+    const clock = clockAt(1000);
+    const frames = framesOn(clock);
+    const {layer} = mountLayer();
+    const {button, reached} = recorder();
+    const release = hold(layer);
+    frames.draw(...at60Hz(1000, 4));
+    clock.time = 1150;
+    release();
+    clock.time = 1170;
+    pointer(button, 'pointerdown', 'touch', 1, 0, 1150);
+    touch(button, 'touchstart', [0], 1, 1150);
+    pointer(button, 'pointerup', 'touch', 1, 0, 1160);
+    const end = touch(button, 'touchend', [0], 0, 1160);
+    click(button, 'touch');
+    expect(end.defaultPrevented).toBe(false);
+    expect(reached).toEqual([
+      'pointerdown',
+      'touchstart',
+      'pointerup',
+      'touchend',
+      'click',
+    ]);
+    // A finger that went down before the hold began is not the hold's.
+    const again = hold(layer);
+    frames.draw(...at60Hz(1180, 4));
+    clock.time = 1330;
+    again();
+    clock.time = 1340;
+    pointer(button, 'pointerdown', 'touch', 2, 0, 1165);
+    pointer(button, 'pointerup', 'touch', 2, 0, 1340);
+    expect(reached.slice(5)).toEqual(['pointerdown', 'pointerup']);
+  });
+
+  it("keeps a late press to its ended hold's scope: after a 'surface' hold that a long task ended, one that went down during it on the page is the page's, and one on the layer is held (spec:AST-094 FR35)", () => {
+    const clock = clockAt(1000);
+    const frames = framesOn(clock);
+    const {layer} = mountLayer();
+    const page = recorder();
+    const onLayer = recorder(layer);
+    const release = hold(layer, 'surface');
+    frames.draw(...at60Hz(1000, 4));
+    clock.time = 1150;
+    release();
+    clock.time = 1160;
+    pointer(page.button, 'pointerdown', 'touch', 1, 0, 1080);
+    pointer(onLayer.button, 'pointerdown', 'touch', 2, 0, 1080);
+    pointer(page.button, 'pointerup', 'touch', 1, 0, 1160);
+    pointer(onLayer.button, 'pointerup', 'touch', 2, 0, 1160);
+    expect(page.reached).toEqual(['pointerdown', 'pointerup']);
+    expect(onLayer.reached).toEqual([]);
+  });
+
+  it(`waits for a late press ${LATE_PRESS_MS} ms after the hold's end at most: then its subscriptions end, and a press that went down during the hold is the page's (spec:AST-094 FR35)`, () => {
+    vi.useFakeTimers({toFake: ['setTimeout', 'clearTimeout']});
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    const clock = clockAt(1000);
+    const frames = framesOn(clock);
+    const added = vi.spyOn(window, 'addEventListener');
+    const removed = vi.spyOn(window, 'removeEventListener');
+    const listening = () => added.mock.calls.length - removed.mock.calls.length;
+    const {layer} = mountLayer();
+    const {button, reached} = recorder();
+    const release = hold(layer);
+    const once = listening();
+    frames.draw(...at60Hz(1000, 4));
+    clock.time = 1150;
+    release();
+    // It still listens, for a press that went down before the end.
+    clock.time += LATE_PRESS_MS - 1;
+    vi.advanceTimersByTime(LATE_PRESS_MS - 1);
+    expect(listening()).toBe(once);
+    clock.time += 1;
+    vi.advanceTimersByTime(1);
+    expect(listening()).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+    clock.time += 1;
+    pointer(button, 'pointerdown', 'touch', 1, 0, 1080);
+    pointer(button, 'pointerup', 'touch', 1, 0, clock.time);
+    expect(reached).toEqual(['pointerdown', 'pointerup']);
+  });
+
+  it("ends the wait after a release in time as the ended hold's layer leaves the page: no listener and no timer stay after the last instance unmounts (spec:AST-094 FR24)", async () => {
+    vi.useFakeTimers({toFake: ['setTimeout', 'clearTimeout']});
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    const clock = clockAt(1000);
+    const frames = framesOn(clock);
+    const added = vi.spyOn(window, 'addEventListener');
+    const removed = vi.spyOn(window, 'removeEventListener');
+    const listening = () => added.mock.calls.length - removed.mock.calls.length;
+    const {layer} = mountLayer();
+    const release = hold(layer);
+    frames.draw(...at60Hz(1000, 4));
+    clock.time = 1060;
+    release();
+    expect(listening()).toBeGreaterThan(0);
+    layer.remove();
+    await flush();
+    expect(listening()).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(frames.waiting).toBe(0);
+  });
+
+  it("ends the wait for a late press as the ended hold's layer leaves the page: no listener and no timer stay after the last instance unmounts (spec:AST-094 FR24)", async () => {
+    vi.useFakeTimers({toFake: ['setTimeout', 'clearTimeout']});
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    const clock = clockAt(1000);
+    const frames = framesOn(clock);
+    const added = vi.spyOn(window, 'addEventListener');
+    const removed = vi.spyOn(window, 'removeEventListener');
+    const listening = () => added.mock.calls.length - removed.mock.calls.length;
+    const {layer} = mountLayer();
+    const release = hold(layer);
+    frames.draw(...at60Hz(1000, 4));
+    clock.time = 1150;
+    release();
+    expect(listening()).toBeGreaterThan(0);
+    layer.remove();
+    await flush();
+    expect(listening()).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(frames.waiting).toBe(0);
+  });
+
+  it('asks for one frame at a time while a layer is held, and none once the hold ends or its layer leaves the page (spec:AST-094 FR24)', () => {
+    const clock = clockAt(1000);
+    const frames = framesOn(clock);
+    const {layer} = mountLayer();
+    const release = hold(layer);
+    expect(frames.waiting).toBe(1);
+    frames.draw(1016);
+    expect(frames.waiting).toBe(1);
+    release();
+    expect(frames.waiting).toBe(0);
+    // A layer that leaves the page while held asks for no frame after it.
+    const other = mountLayer().layer;
+    hold(other);
+    expect(frames.waiting).toBe(1);
+    other.remove();
+    frames.draw(1033);
+    expect(frames.waiting).toBe(0);
+  });
+
+  it('waits for a late press after a hold that saw no frame, as in a hidden tab, and ends that wait at its cap or as the layer leaves the page (spec:AST-094 FR35)', async () => {
+    vi.useFakeTimers({toFake: ['setTimeout', 'clearTimeout']});
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    const clock = clockAt(1000);
+    framesOn(clock);
+    const added = vi.spyOn(window, 'addEventListener');
+    const removed = vi.spyOn(window, 'removeEventListener');
+    const listening = () => added.mock.calls.length - removed.mock.calls.length;
+    const first = mountLayer().layer;
+    const release = hold(first);
+    clock.time = 1200;
+    release();
+    expect(listening()).toBeGreaterThan(0);
+    clock.time += LATE_PRESS_MS;
+    vi.advanceTimersByTime(LATE_PRESS_MS);
+    expect(listening()).toBe(0);
+    const second = mountLayer().layer;
+    const releaseSecond = hold(second);
+    clock.time += 200;
+    releaseSecond();
+    expect(listening()).toBeGreaterThan(0);
+    second.remove();
+    await flush();
+    expect(listening()).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('lets a touch after the release through when a held touch ended where the window could not hear it, its identifier reused', () => {
+    const {layer} = mountLayer();
+    const {button, reached} = recorder();
+    const release = hold(layer);
+    // A held touch whose end went to its removed target, unheard here.
+    touch(button, 'touchstart', [0]);
+    release();
+    // The next touch reuses its identifier: it is the page's, and so is its
+    // end, which the browser follows with a click.
+    touch(button, 'touchstart', [0]);
+    const end = touch(button, 'touchend', [0], 0);
+    expect(end.defaultPrevented).toBe(false);
+    mouse(button, 'click');
+    expect(reached).toEqual(['touchstart', 'touchend', 'click']);
+  });
+
+  it('holds nothing once its layer has left the document', () => {
+    const {layer} = mountLayer();
+    hold(layer);
+    layer.remove();
+    const {button, reached} = recorder();
+    tap(button, 'touch');
+    expect(reached).toEqual(['pointerdown', 'pointerup', 'click']);
+  });
+});
+
+describe("holdInput's dismissal that keeps focus inside (component:BottomSheet FR9)", () => {
+  it('keeps the page live: no shield, the layer lets pointers through, and a finger press on the page still acts', async () => {
+    const {layer, child} = mountLayer();
+    const page = document.createElement('button');
+    document.body.append(page);
+    onTestFinished(() => {
+      layer.remove();
+      page.remove();
+    });
+    act(() => child.focus());
+    const end = deferred();
+    holdInput(layer, {
+      until: end.promise,
+      scope: 'layer',
+      focus: 'kept-inside',
+    });
+    expect(layer.style.pointerEvents).toBe('none');
+    expect(isInHeldLayer(child)).toBe(false);
+    expect(
+      document.querySelector('[popover="manual"][aria-hidden="true"]'),
+    ).toBeNull();
+    const onPageClick = vi.fn();
+    page.addEventListener('click', onPageClick);
+    page.dispatchEvent(
+      new PointerEvent('pointerdown', {bubbles: true, pointerType: 'touch'}),
+    );
+    page.dispatchEvent(new MouseEvent('click', {bubbles: true}));
+    expect(onPageClick).toHaveBeenCalledTimes(1);
+    end.resolve();
+    await flush();
+    expect(layer.style.pointerEvents).toBe('');
+  });
+
+  it('keeps focused content exposed and takes no click and no key but Tab while focus stays inside', () => {
+    const {layer, child} = mountLayer();
+    onTestFinished(() => layer.remove());
+    act(() => child.focus());
+    const release = holdInput(layer, {
+      until: new Promise<never>(() => {}),
+      scope: 'layer',
+      focus: 'kept-inside',
+    });
+    expect(layer).not.toHaveAttribute('inert');
+    expect(layer).not.toHaveAttribute('aria-hidden');
+    expect(child).not.toHaveAttribute('inert');
+    expect(child).toHaveFocus();
+    const onClick = vi.fn();
+    const onKey = vi.fn();
+    child.addEventListener('click', onClick);
+    child.addEventListener('keydown', onKey);
+    child.dispatchEvent(
+      new MouseEvent('click', {bubbles: true, cancelable: true}),
+    );
+    const enter = new KeyboardEvent('keydown', {
+      key: 'Enter',
+      bubbles: true,
+      cancelable: true,
+    });
+    child.dispatchEvent(enter);
+    expect(onClick).not.toHaveBeenCalled();
+    expect(onKey).not.toHaveBeenCalled();
+    expect(enter.defaultPrevented).toBe(true);
+    const tab = new KeyboardEvent('keydown', {
+      key: 'Tab',
+      bubbles: true,
+      cancelable: true,
+    });
+    child.dispatchEvent(tab);
+    expect(onKey).toHaveBeenCalledTimes(1);
+    expect(tab.defaultPrevented).toBe(false);
+    release();
+  });
+
+  it('lets a document listener added before the hold, as the modality tracker is, hear a key it keeps from the layer', () => {
+    const {layer, child} = mountLayer();
+    onTestFinished(() => layer.remove());
+    const onDocumentKey = vi.fn();
+    document.addEventListener('keydown', onDocumentKey, {capture: true});
+    onTestFinished(() =>
+      document.removeEventListener('keydown', onDocumentKey, {capture: true}),
+    );
+    act(() => child.focus());
+    const release = holdInput(layer, {
+      until: new Promise<never>(() => {}),
+      scope: 'layer',
+      focus: 'kept-inside',
+    });
+    const onLayerCapture = vi.fn();
+    layer.addEventListener('keydown', onLayerCapture, {capture: true});
+    child.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'Escape',
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    expect(onDocumentKey).toHaveBeenCalledTimes(1);
+    expect(onLayerCapture).not.toHaveBeenCalled();
+    release();
+  });
+
+  it('makes the layer itself inert and aria-hidden once focus leaves, and gives both back at the end', async () => {
+    const {layer, child} = mountLayer();
+    const outside = document.createElement('button');
+    document.body.append(outside);
+    onTestFinished(() => {
+      layer.remove();
+      outside.remove();
+    });
+    act(() => child.focus());
+    const end = deferred();
+    holdInput(layer, {
+      until: end.promise,
+      scope: 'layer',
+      focus: 'kept-inside',
+    });
+    act(() => outside.focus());
+    await flush();
+    expect(layer).toHaveAttribute('inert');
+    expect(layer).toHaveAttribute('aria-hidden', 'true');
+    end.resolve();
+    await flush();
+    expect(layer).not.toHaveAttribute('inert');
+    expect(layer).not.toHaveAttribute('aria-hidden');
+  });
+
+  it('makes the layer itself inert and aria-hidden at once when focus was not inside', () => {
+    const {layer} = mountLayer();
+    onTestFinished(() => layer.remove());
+    const release = holdInput(layer, {
+      until: new Promise<never>(() => {}),
+      scope: 'layer',
+      focus: 'kept-inside',
+    });
+    expect(layer).toHaveAttribute('inert');
+    expect(layer).toHaveAttribute('aria-hidden', 'true');
+    release();
+    expect(layer).not.toHaveAttribute('inert');
+  });
+
+  it("leaves a 'blur' dismissal as before: its content inert under a shield, focus moved out", () => {
+    const {layer, child} = mountLayer();
+    onTestFinished(() => layer.remove());
+    act(() => child.focus());
+    const release = holdInput(layer, {
+      until: new Promise<never>(() => {}),
+      scope: 'layer',
+    });
+    expect(child).toHaveAttribute('inert');
+    expect(layer).not.toHaveAttribute('inert');
+    expect(child).not.toHaveFocus();
+    expect(isInHeldLayer(child)).toBe(true);
+    release();
+  });
+});
+
+describe("a released 'kept-inside' hold", () => {
+  it('leaves the layer usable when its focus check runs after the release', async () => {
+    const layer = document.createElement('div');
+    const inside = document.createElement('button');
+    const outside = document.createElement('button');
+    layer.append(inside);
+    document.body.append(layer, outside);
+    inside.focus();
+
+    const release = holdInput(layer, {
+      until: new Promise<never>(() => {}),
+      scope: 'layer',
+      focus: 'kept-inside',
+    });
+    // As a closing BottomSheet does: focus returns to its trigger, which
+    // queues the hold's focus check, and the hold is released in the same task.
+    outside.focus();
+    release();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(layer.hasAttribute('inert')).toBe(false);
+    expect(layer.hasAttribute('aria-hidden')).toBe(false);
+    layer.remove();
+    outside.remove();
+  });
+});

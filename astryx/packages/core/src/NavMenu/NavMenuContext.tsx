@@ -1,0 +1,85 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+
+'use client';
+
+/**
+ * @file NavMenuContext.tsx
+ * @input Layer-scoped React context/use
+ * @output Exports NavHeadingCloseContext, NavHeadingMenuContext, and hooks
+ * @position Context providers; consumed by NavHeadingMenu and NavHeadingMenuItem
+ *
+ * SYNC: When modified, update:
+ * - /packages/core/src/NavMenu/index.ts
+ */
+
+import {use} from 'react';
+import {createLayerScopedContext} from '../Layer/layerScopedContext';
+import {createSharedContext} from '../utils/sharedContext';
+
+export type NavHeadingMenuSize = 'sm' | 'md' | 'lg';
+
+/**
+ * Close callback provided by the nav heading popover.
+ * NavHeadingMenu reads this to dismiss the popover on item selection
+ * and on Escape.
+ */
+export interface NavHeadingCloseContextValue {
+  closeMenu: () => void;
+}
+
+export const NavHeadingCloseContext =
+  createSharedContext<NavHeadingCloseContextValue | null>(
+    'NavHeadingCloseContext',
+    1,
+    null,
+  );
+NavHeadingCloseContext.displayName = 'NavHeadingCloseContext';
+
+export function useNavHeadingCloseContext(): NavHeadingCloseContextValue | null {
+  return use(NavHeadingCloseContext);
+}
+
+/**
+ * Internal (not exported from the NavMenu entry): the dismissal a nav heading
+ * popover gives its menu when its items do not close it on selection (an
+ * expanded SideNavHeading, FR7). NavHeadingMenu calls it for a mouse released
+ * outside, never on an item's selection.
+ */
+export const NavHeadingDismissContext = createSharedContext<{
+  dismiss: () => void;
+} | null>('NavHeadingDismissContext', 1, null);
+NavHeadingDismissContext.displayName = 'NavHeadingDismissContext';
+
+/**
+ * Internal (not exported from the NavMenu entry): true inside the named
+ * `role="menu"` region a SideNavHeading or TopNavHeading popover wraps around
+ * its `menu`. A NavHeadingMenu there renders no menu of its own, so its items
+ * belong to the heading's menu.
+ */
+export const NavHeadingMenuHostContext = createSharedContext<boolean>(
+  'NavHeadingMenuHostContext',
+  1,
+  false,
+);
+NavHeadingMenuHostContext.displayName = 'NavHeadingMenuHostContext';
+
+/**
+ * Size and close context provided by NavHeadingMenu to its children.
+ * Items read this for consistent padding and dismiss-on-click.
+ */
+export interface NavHeadingMenuContextValue {
+  size: NavHeadingMenuSize;
+  closeMenu: () => void;
+}
+
+export const NavHeadingMenuContext =
+  createLayerScopedContext<NavHeadingMenuContextValue | null>(
+    'NavHeadingMenuContext',
+    1,
+    null,
+  );
+NavHeadingMenuContext.displayName = 'NavHeadingMenuContext';
+
+export function useNavHeadingMenuContext(): NavHeadingMenuContextValue | null {
+  return use(NavHeadingMenuContext);
+}
